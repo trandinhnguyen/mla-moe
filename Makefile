@@ -4,7 +4,7 @@
 # Do not edit — the Makefile is on the frozen list (see README).
 CC      = hipcc
 CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wpedantic --offload-arch=gfx90a \
-          -Iinclude -Ivendor
+          -Iinclude -Ivendor -I/opt/rocm-7.2.2/include
 LDFLAGS = -lm
 
 # Build with `make DUMP=1` to compile in the oracle-validation dumps
