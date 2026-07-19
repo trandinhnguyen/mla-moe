@@ -120,11 +120,9 @@ void device_malloc_model_weights(Transformer *t)
 
         device_malloc_and_copy((void **)&d_w.W_UK[l], w->W_UK[l],
                                c->n_heads * c->kv_lora_rank *
-                                   c->qk_nope_head_dim * sizeof(bf16_t));
-
-        device_malloc_and_copy((void **)&d_w.W_UV[l], w->W_UV[l],
-                               c->n_heads * c->kv_lora_rank * c->v_head_dim *
+                                   (c->qk_nope_head_dim + c->v_head_dim) *
                                    sizeof(bf16_t));
+        d_w.W_UV[l] = d_w.W_UK[l] + c->qk_nope_head_dim * c->kv_lora_rank;
 
         device_malloc_and_copy((void **)&d_w.o_proj[l], w->o_proj[l],
                                c->n_heads * c->v_head_dim * c->hidden_size *
@@ -160,7 +158,7 @@ void device_malloc_model_weights(Transformer *t)
         }
         else
         {
-            w->dense_gate[l] = w->dense_up[l] = w->dense_down[l] = NULL;
+            d_w.dense_gate[l] = d_w.dense_up[l] = d_w.dense_down[l] = NULL;
 
             /* MoE routing */
             device_malloc_and_copy((void **)&d_w.moe_gate[l], w->moe_gate[l],
