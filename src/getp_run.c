@@ -24,11 +24,11 @@
 #define HIP_CHECK(cmd)                                                         \
     do                                                                         \
     {                                                                          \
-        hipError_t e = (cmd);                                                  \
-        if (e != hipSuccess)                                                   \
+        hipError_t err = (cmd);                                                \
+        if (err != hipSuccess)                                                 \
         {                                                                      \
             fprintf(stderr, "HIP error %s:%d: %s\n", __FILE__, __LINE__,       \
-                    hipGetErrorString(e));                                     \
+                    hipGetErrorString(err));                                   \
             exit(EXIT_FAILURE);                                                \
         }                                                                      \
     } while (0)
@@ -195,13 +195,6 @@ void device_malloc_model_weights(Transformer *t)
                 device_malloc_and_copy(
                     (void **)&d_w.expert_gate[l][e], w->expert_gate[l][e],
                     c->hidden_size * c->moe_inter_size * sizeof(bf16_t));
-                if (l == 1)
-                {
-                    printf("alloc expert_gate[%d][%d] = %p\n", l, e,
-                           (void *)d_w.expert_gate[l][e]);
-                    printf("alloc host_gate[%d][%d] = %p\n", l, e,
-                           (void *)w->expert_gate[l][e]);
-                }
                 device_malloc_and_copy(
                     (void **)&d_w.expert_up[l][e], w->expert_up[l][e],
                     c->hidden_size * c->moe_inter_size * sizeof(bf16_t));
@@ -303,8 +296,6 @@ void device_free_model_weights(Transformer *t)
 
             for (int e = 0; e < c->n_routed_experts; e++)
             {
-                printf("free expert_gate[%d][%d] = %p\n", l, e,
-                       (void *)d_w.expert_gate[l][e]);
                 HIP_CHECK(hipFree(d_w.expert_gate[l][e]));
                 HIP_CHECK(hipFree(d_w.expert_up[l][e]));
                 HIP_CHECK(hipFree(d_w.expert_down[l][e]));
