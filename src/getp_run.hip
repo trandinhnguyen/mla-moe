@@ -1,11 +1,17 @@
 /* ============================================================================
- * THIS IS THE ONLY FILE YOU MAY MODIFY.
+ * THIS IS THE FILE YOU MODIFY (a HIP/C++ translation unit).
  *
  * Your task: maximize end-to-end throughput (tok/s) of inference() over the
  * request batch, WITHOUT breaking correctness (`make eval` must still pass its
  * thresholds). The intended path is to port the compute to the GPU: start from
  * this correct CPU reference, then replace the forward_* calls with your own
  * kernels — allocate/upload in warm_up(), free in finish().
+ *
+ * Write __global__ kernels here (note the trailing double underscores) and launch
+ * them with <<<>>> directly; expose inference()/warm_up()/finish() as usual — they
+ * link to the C harness via the extern "C" guards in getp.h. To split kernels
+ * across files, add more .hip files under src/kernels/ (picked up automatically,
+ * no Makefile edit). Everything else is frozen.
  *
  * The frozen harness (src/getp_eval.c) times inference() and prints your score.
  * The frozen reference kernels are declared in include/engine.h.

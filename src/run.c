@@ -643,7 +643,7 @@ int main(int argc, char *argv[]) {
             "                    -> batch-throughput grading: warm_up, then timed inference over\n"
             "                       the request set (line 0 = count, then one prompt/line); prints\n"
             "                       'achieved throughput TPS (tok/s)' and writes generated ids.\n"
-            "                       The candidate's inference() lives in src/getp_run.c\n",
+            "                       The candidate's inference() lives in src/getp_run.hip\n",
             argv[0]);
         return 1;
     }

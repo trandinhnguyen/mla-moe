@@ -1,11 +1,15 @@
-/* Frozen engine entry points the candidate driver (src/getp_run.c) may call.
+/* Frozen engine entry points the candidate driver (src/getp_run.hip) may call.
  * These are the oracle-validated CPU reference kernels defined in src/run.c.
  * A candidate porting to GPU starts by calling them (correct-by-construction),
- * then replaces them incrementally with their own kernels inside getp_run.c. */
+ * then replaces them incrementally with their own kernels inside getp_run.hip. */
 #ifndef MLA_ENGINE_H
 #define MLA_ENGINE_H
 
 #include "model.h"   /* Transformer */
+
+#ifdef __cplusplus
+extern "C" {   /* C linkage so the C++/HIP getp_run TU resolves these unmangled */
+#endif
 
 /* Teacher-forced top-1 capture — opaque to the driver; always pass NULL. */
 typedef struct TeacherForce TeacherForce;
@@ -20,5 +24,9 @@ float *forward_absorbed(Transformer *t, int token, int pos);
 
 /* Greedy argmax over `vocab_size` logits. */
 int sample(float *logits, int vocab_size);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* MLA_ENGINE_H */

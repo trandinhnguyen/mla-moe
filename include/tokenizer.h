@@ -7,6 +7,10 @@
  * non-ASCII letter/punctuation/CJK handling is intentionally not implemented
  * (such input still yields valid tokens, but may split differently). */
 
+#ifdef __cplusplus
+extern "C" {   /* C linkage so the C++/HIP getp_run TU resolves these unmangled */
+#endif
+
 typedef struct Tokenizer Tokenizer;
 
 /* Load <model_dir>/tokenizer.json (+ config.json for bos/eos). Returns NULL if
@@ -25,5 +29,9 @@ char *tokenizer_decode(const Tokenizer *t, const int *ids, int n);
 int  tokenizer_bos_id(const Tokenizer *t);   /* -1 if none */
 int  tokenizer_eos_id(const Tokenizer *t);   /* -1 if none */
 void tokenizer_free(Tokenizer *t);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* TOKENIZER_H */

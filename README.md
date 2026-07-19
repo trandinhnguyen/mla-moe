@@ -169,8 +169,11 @@ uv run python tests/bench/bench.py dsv2lite -r ./run     -o /tmp/cur.json --comp
 This is the intern exam surface: a working CPU baseline that you optimize by
 porting the compute to the GPU.
 
-**You modify exactly one file: `src/getp_run.c`.** It implements `warm_up()`,
-`finish()`, and `inference()` (contract in `include/getp.h`). Everything else is
+**You modify exactly one file: `src/getp_run.hip`.** It implements `warm_up()`,
+`finish()`, and `inference()` (contract in `include/getp.h`). It compiles as a
+HIP/C++ translation unit, so you write `__global__` kernels and launch them with
+`<<<>>>` directly in it; to split kernels across files, add `src/kernels/*.hip`
+(picked up automatically, no Makefile edit). Everything else is
 frozen — `src/run.c` and its forward kernels, `src/getp_eval.c` (the timing
 harness), `model_load.c`, `tokenizer.c`, `main.c`, `tests/`, and `include/*`.
 The frozen CPU kernels are declared in `include/engine.h`; the reference
@@ -204,12 +207,16 @@ Performance work (blocked matmuls, threading) is deferred — correctness first.
 ## Candidate hand-off — status
 
 The hand-off scaffolding now exists with a frozen/editable split:
-`src/getp_eval.c` is the frozen timing harness and `src/getp_run.c` is the sole
-editable file. See **Candidate task & throughput grading** above.
+`src/getp_eval.c` is the frozen timing harness and `src/getp_run.hip` (+ optional
+`src/kernels/*.hip`) is the editable surface. See **Candidate task & throughput
+grading** above.
 
 The `Makefile` is **frozen**, pre-set to the GPU toolchain `hipcc
 --offload-arch=gfx90a` (MI250 / CDNA2). The CPU reference compiles and runs as
 host code under hipcc (verified), so it is correct on day one; candidates write
-HIP kernels in `src/getp_run.c` against the same target. Frozen list: `Makefile`,
-`src/run.c` and its kernels, `src/getp_eval.c`, `model_load.c`, `tokenizer.c`,
-`main.c`, `tests/`, `include/*` — **editable: `src/getp_run.c` only.**
+HIP `__global__` kernels directly in `src/getp_run.hip` (a HIP/C++ TU) against
+the same target. The frozen headers `engine.h`/`getp.h`/`tokenizer.h` carry
+`extern "C"` guards so the C++ TU links against the C reference. Frozen list:
+`Makefile`, `src/run.c` and its kernels, `src/getp_eval.c`, `model_load.c`,
+`tokenizer.c`, `main.c`, `tests/`, `include/*` — **editable: `src/getp_run.hip`
+(+ `src/kernels/*.hip`).**

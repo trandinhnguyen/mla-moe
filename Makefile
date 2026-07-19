@@ -1,6 +1,6 @@
 # FROZEN exam toolchain: hipcc targeting MI250 (gfx90a / CDNA2). The CPU
 # reference builds and runs as ordinary host code under hipcc on day one;
-# candidates add HIP device kernels in src/getp_run.c against this same target.
+# candidates add HIP device kernels in src/getp_run.hip against this same target.
 # Do not edit — the Makefile is on the frozen list (see README).
 CC      = hipcc
 CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wpedantic --offload-arch=gfx90a \
@@ -13,15 +13,33 @@ ifdef DUMP
 CFLAGS += -DMLA_ENABLE_DUMP
 endif
 
+# HIP device flags: compile the candidate's getp_run TU as C++/HIP. NO -std=c11
+# (fatal in HIP mode: "invalid argument '-std=c11' not allowed with 'HIP'") and
+# no -Wpedantic (warns on HIP extensions). -ffp-contract=off keeps kernel fp32
+# rounding aligned with the CPU reference so `make eval` stays within tolerance;
+# a candidate may drop it for speed at their own correctness risk.
+HIPFLAGS = -O2 -Wall -Wextra -ffp-contract=off --offload-arch=gfx90a \
+           -Iinclude -Ivendor
+ifdef DUMP
+HIPFLAGS += -DMLA_ENABLE_DUMP
+endif
+
 LIB_SRCS = src/safetensors_loader.c \
            src/tensor.c
 
 # Two binaries:
 #   run      — llama2.c-style inference entry point (src/run.c)
 #   mla-moe  — weight inspection CLI (src/main.c)
-RUN_SRCS  = $(LIB_SRCS) vendor/cJSON.c src/tokenizer.c src/model_load.c src/dump.c \
-            src/getp_eval.c src/getp_run.c src/run.c
-TOOL_SRCS = $(LIB_SRCS) src/main.c
+# Frozen C reference/host TUs (compiled with -std=c11). getp_run is NOT here — it
+# is the candidate's HIP/C++ TU so __global__ kernels can live in it.
+RUN_C_SRCS = $(LIB_SRCS) vendor/cJSON.c src/tokenizer.c src/model_load.c src/dump.c \
+             src/getp_eval.c src/run.c
+# Candidate-editable HIP TU (+ optional extra kernel files under src/kernels/).
+# Drop the $(wildcard ...) if you want strictly one editable file.
+HIP_SRCS   = src/getp_run.hip $(wildcard src/kernels/*.hip)
+RUN_C_OBJS = $(RUN_C_SRCS:.c=.o)
+HIP_OBJS   = $(HIP_SRCS:.hip=.o)
+TOOL_SRCS  = $(LIB_SRCS) src/main.c
 
 .PHONY: all clean tok-cli eval eval-gen ref-binary bench getp
 
@@ -51,7 +69,7 @@ bench: run
 	  $(if $(OUT),-o $(OUT),) $(if $(COMPARE),--compare $(COMPARE),)
 
 # Batch-throughput grading (the perf score). Runs the fixed request set through
-# the candidate's inference() (src/getp_run.c) and prints one tok/s number.
+# the candidate's inference() (src/getp_run.hip) and prints one tok/s number.
 # MODEL selects tests/eval/<MODEL>/requests.txt; MODELDIR points at the weights
 # (defaults to $DSV / $GLM per model). Override STEPS/OUT as needed.
 MODELDIR ?= $(if $(filter glm47,$(MODEL)),$(GLM),$(DSV))
@@ -77,19 +95,38 @@ ref-binary:
 tok-cli: src/tokenizer.c vendor/cJSON.c tests/tokenizer/tok_cli.c
 	$(CC) $(CFLAGS) $^ -o tests/tokenizer/tok_cli $(LDFLAGS)
 
-run: $(RUN_SRCS)
-	$(CC) $(CFLAGS) $(RUN_SRCS) -o $@ $(LDFLAGS)
+# Separate compilation: C TUs keep -std=c11; the HIP TU compiles without it (it
+# is fatal in HIP mode). Never put .c sources and .o objects on the same hipcc
+# line — its injected -x c sticks to the trailing .o and breaks the build; the
+# link recipes below use objects only.
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+%.o: %.hip
+	$(CC) $(HIPFLAGS) -c $< -o $@
+
+run: $(RUN_C_OBJS) $(HIP_OBJS)
+	$(CC) $(RUN_C_OBJS) $(HIP_OBJS) -o $@ $(LDFLAGS)
 
 mla-moe: $(TOOL_SRCS)
 	$(CC) $(CFLAGS) $(TOOL_SRCS) -o $@ $(LDFLAGS)
 
-debug-run: CFLAGS += -O0 -g -fsanitize=address,undefined
-debug-run: $(RUN_SRCS)
-	$(CC) $(CFLAGS) $(RUN_SRCS) -o run $(LDFLAGS)
+# ASan/UBSan debug build. Distinct .dbg.o object names so the -O2 `run` objects
+# are not silently reused with sanitizer flags (make would see them up-to-date).
+SANFLAGS = -O0 -g -fsanitize=address,undefined
+debug-run: CFLAGS   += $(SANFLAGS)
+debug-run: HIPFLAGS += $(SANFLAGS)
+debug-run: $(RUN_C_OBJS:.o=.dbg.o) $(HIP_OBJS:.o=.dbg.o)
+	$(CC) $(SANFLAGS) $(RUN_C_OBJS:.o=.dbg.o) $(HIP_OBJS:.o=.dbg.o) -o run $(LDFLAGS)
+
+%.dbg.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+%.dbg.o: %.hip
+	$(CC) $(HIPFLAGS) -c $< -o $@
 
 debug-tool: CFLAGS += -O0 -g -fsanitize=address,undefined
 debug-tool: $(TOOL_SRCS)
 	$(CC) $(CFLAGS) $(TOOL_SRCS) -o mla-moe $(LDFLAGS)
 
 clean:
-	rm -f run mla-moe
+	rm -f run mla-moe $(RUN_C_OBJS) $(HIP_OBJS) \
+	      $(RUN_C_OBJS:.o=.dbg.o) $(HIP_OBJS:.o=.dbg.o)
