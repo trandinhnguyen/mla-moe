@@ -135,6 +135,8 @@ float *device_logits = nullptr;
 MaxPair *device_block_max = nullptr;
 int *device_token = nullptr;
 int sample_blocks = 0;
+hipStream_t shared_expert_stream = nullptr;
+hipEvent_t moe_input_ready = nullptr, shared_expert_done = nullptr;
 
 struct DeviceLayer {
     uint16_t *q_proj = nullptr, *kv_a = nullptr, *kv_up = nullptr, *o_proj = nullptr;
@@ -597,15 +599,18 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
     const int H=c.hidden_size,K=c.n_experts_per_tok;
     const int SHARED=c.n_shared_experts*c.moe_inter_size;
     dsv2_prepare_batched_bf16(input,batch,H,0);
+    hip_check(hipEventRecord(moe_input_ready,0),"record MoE input ready");
+    hip_check(hipStreamWaitEvent(shared_expert_stream,moe_input_ready,0),
+              "wait for MoE input on shared stream");
+    auto *shared_bf16=reinterpret_cast<uint16_t *>(gpu_state.phb);
+    dsv2_launch_single_gate_up(shared_bf16,nullptr,w.shared_gate,w.shared_up,
+                              batch,SHARED,H,shared_expert_stream);
+    dsv2_launch_bf16_input_matvec(output,shared_bf16,w.shared_down,
+                                  batch,H,SHARED,shared_expert_stream);
     dsv2_launch_prepared_matvec(gpu_state.prouter,w.router,batch,
                                c.n_routed_experts,H,0);
     dsv2_launch_batched_router_topk(gpu_state.prouter,batch,c.n_routed_experts,K,
                                     gpu_state.ptopk_index,gpu_state.ptopk_weight,0);
-    auto *shared_bf16=reinterpret_cast<uint16_t *>(gpu_state.phb);
-    dsv2_launch_single_gate_up(shared_bf16,nullptr,w.shared_gate,w.shared_up,
-                              batch,SHARED,H,0);
-    dsv2_launch_bf16_input_matvec(output,shared_bf16,w.shared_down,
-                                  batch,H,SHARED,0);
     int capacity=std::min(ROUTE_CAPACITY,std::max(128,
         (batch*K+c.n_routed_experts-1)/c.n_routed_experts*5));
     dsv2_launch_bucket_routes(gpu_state.ptopk_index,gpu_state.ptopk_weight,batch,K,
@@ -625,6 +630,10 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
         reinterpret_cast<const uint16_t *const *>(w.expert_down_table),
         gpu_state.expert_counts,gpu_state.expert_slots,c.n_routed_experts,
         capacity,H,c.moe_inter_size,1,0);
+    hip_check(hipEventRecord(shared_expert_done,shared_expert_stream),
+              "record shared expert completion");
+    hip_check(hipStreamWaitEvent(0,shared_expert_done,0),
+              "join shared expert stream");
     dsv2_launch_batched_weighted_add(output,gpu_state.pexpert_up,
                                      gpu_state.ptopk_weight,batch,K,H,0);
 }
@@ -817,6 +826,12 @@ void warm_up(Transformer *t) {
      * natural home for future persistent device weights and activation pools. */
     select_single_gpu();
     hip_check(hipFree(nullptr), "initialize HIP runtime");
+    hip_check(hipStreamCreateWithFlags(&shared_expert_stream,hipStreamNonBlocking),
+              "create shared expert stream");
+    hip_check(hipEventCreateWithFlags(&moe_input_ready,hipEventDisableTiming),
+              "create MoE input event");
+    hip_check(hipEventCreateWithFlags(&shared_expert_done,hipEventDisableTiming),
+              "create shared expert event");
     const Config &warm_config=t->config;
     int max_gemm_cols=warm_config.dense_inter_size;
     int shared_cols=warm_config.n_shared_experts*warm_config.moe_inter_size;
@@ -848,6 +863,10 @@ void warm_up(Transformer *t) {
 }
 
 void finish(Transformer *t) {
+    hip_check(hipEventDestroy(shared_expert_done),"destroy shared expert event");
+    hip_check(hipEventDestroy(moe_input_ready),"destroy MoE input event");
+    hip_check(hipStreamDestroy(shared_expert_stream),"destroy shared expert stream");
+    shared_expert_done=nullptr;moe_input_ready=nullptr;shared_expert_stream=nullptr;
     dsv2_finish_mfma_gemm();
     free(prompt_scratch);
     prompt_scratch = nullptr;
