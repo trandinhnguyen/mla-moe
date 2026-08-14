@@ -48,6 +48,15 @@ void dsv2_launch_prepared_matvec(float *,const uint16_t *,int,int,int,hipStream_
 void dsv2_launch_prepared_swiglu(float *,const uint16_t *,const uint16_t *,int,int,int,hipStream_t);
 void dsv2_launch_batched_lm_argmax_partials(float *,int *,const float *,
                                              const uint16_t *,int,int,int,hipStream_t);
+void dsv2_launch_quantize_weight_i8(int8_t *,float *,const uint16_t *,int,int,
+                                    hipStream_t);
+void dsv2_launch_batched_lm_argmax_i8(float *,int *,const float *,int8_t *,
+    const int8_t *,const float *,int,int,int,hipStream_t);
+void dsv2_launch_quantize_expert_activation_i8(int8_t *,float *,const uint16_t *,
+    const int *,int,int,int,hipStream_t);
+void dsv2_launch_grouped_expert_gemm_i8(float *,const int8_t *,
+    const int8_t *const *,const float *const *,const float *,const int *,
+    const int *,int,int,int,int,hipStream_t);
 void dsv2_launch_batched_rmsnorm(float *,const float *,const uint16_t *,int,int,float,hipStream_t);
 void dsv2_launch_batched_rmsnorm_strided(float *,int,const float *,int,const uint16_t *,int,int,float,hipStream_t);
 void dsv2_launch_batched_embedding(float *,const uint16_t *,const int *,int,int,hipStream_t);
@@ -130,6 +139,8 @@ int *prompt_scratch = nullptr;
 float *device_logits = nullptr;
 MaxPair *device_block_max = nullptr;
 int *device_token = nullptr;
+int8_t *lm_head_i8 = nullptr, *lm_input_i8 = nullptr;
+float *lm_head_scale = nullptr;
 int sample_blocks = 0;
 
 struct DeviceLayer {
@@ -141,8 +152,12 @@ struct DeviceLayer {
     uint16_t *expert_gate[DSV2_MAX_EXPERTS]{};
     uint16_t *expert_up[DSV2_MAX_EXPERTS]{};
     uint16_t *expert_down[DSV2_MAX_EXPERTS]{};
+    int8_t *expert_down_i8[DSV2_MAX_EXPERTS]{};
+    float *expert_down_scale[DSV2_MAX_EXPERTS]{};
     uint16_t **expert_gate_table = nullptr, **expert_up_table = nullptr,
               **expert_down_table = nullptr;
+    int8_t **expert_down_i8_table = nullptr;
+    float **expert_down_scale_table = nullptr;
 };
 
 struct DeviceModel {
@@ -175,6 +190,7 @@ struct DeviceState {
     int *expert_counts = nullptr, *expert_slots = nullptr;
     float *expert_slot_weights = nullptr;
     uint16_t *expert_bf16 = nullptr;
+    float *expert_i8_scale = nullptr;
 };
 
 DeviceModel gpu_model;
@@ -411,9 +427,35 @@ void allocate_device_state(Transformer *t) {
         (size_t)c.n_routed_experts * ROUTE_CAPACITY,"allocate expert route weights");
     gpu_state.expert_bf16 = device_allocate<uint16_t>(
         (size_t)c.n_routed_experts*ROUTE_CAPACITY*H,"allocate packed expert bf16");
+    gpu_state.expert_i8_scale=device_allocate<float>(
+        (size_t)c.n_routed_experts*ROUTE_CAPACITY,"allocate expert INT8 scales");
     hip_check(hipMemcpy(gpu_state.inverse_frequency, t->rope_inv_freq,
                         (size_t)c.qk_rope_head_dim / 2 * sizeof(float),
                         hipMemcpyHostToDevice), "upload rope frequency");
+}
+
+void prepare_int8_expert_down(Transformer *t){
+    const Config &c=t->config;const int rows=c.hidden_size,cols=c.moe_inter_size;
+    for(int l=c.first_k_dense;l<c.n_layers;++l){DeviceLayer &d=gpu_model.layer[l];
+        for(int e=0;e<c.n_routed_experts;++e){
+            d.expert_down_i8[e]=device_allocate<int8_t>((size_t)rows*cols,
+                "allocate INT8 expert down");
+            d.expert_down_scale[e]=device_allocate<float>(rows,
+                "allocate INT8 expert down scales");
+            dsv2_launch_quantize_weight_i8(d.expert_down_i8[e],d.expert_down_scale[e],
+                d.expert_down[e],rows,cols,0);
+        }
+        d.expert_down_i8_table=device_allocate<int8_t *>(c.n_routed_experts,
+            "allocate INT8 expert down table");
+        d.expert_down_scale_table=device_allocate<float *>(c.n_routed_experts,
+            "allocate INT8 expert scale table");
+        hip_check(hipMemcpy(d.expert_down_i8_table,d.expert_down_i8,
+            sizeof(int8_t *)*c.n_routed_experts,hipMemcpyHostToDevice),
+            "upload INT8 expert down table");
+        hip_check(hipMemcpy(d.expert_down_scale_table,d.expert_down_scale,
+            sizeof(float *)*c.n_routed_experts,hipMemcpyHostToDevice),
+            "upload INT8 expert scale table");
+    }
 }
 
 __device__ MaxPair better(MaxPair a, MaxPair b) {
@@ -556,8 +598,8 @@ void gpu_lm_argmax(const float *input,const uint16_t *weight,int batch,
     int tiles=(vocab+63)/64;size_t partials=(size_t)batch*tiles;
     float *values=device_logits;
     int *indices=reinterpret_cast<int *>(device_logits+partials);
-    dsv2_launch_batched_lm_argmax_partials(values,indices,input,weight,batch,
-                                            vocab,hidden,0);
+    dsv2_launch_batched_lm_argmax_i8(values,indices,input,lm_input_i8,lm_head_i8,
+                                     lm_head_scale,batch,vocab,hidden,0);
     batched_partial_argmax<<<batch,256>>>(values,indices,tiles,batch,device_token);
 }
 
@@ -612,11 +654,15 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
         reinterpret_cast<const uint16_t *const *>(w.expert_gate_table),
         reinterpret_cast<const uint16_t *const *>(w.expert_up_table),
         gpu_state.expert_counts,c.n_routed_experts,capacity,c.moe_inter_size,H,0);
-    dsv2_launch_grouped_expert_gemm(gpu_state.pexpert_up,
-        fused_expert_bf16,
-        reinterpret_cast<const uint16_t *const *>(w.expert_down_table),
-        gpu_state.expert_counts,gpu_state.expert_slots,c.n_routed_experts,
-        capacity,H,c.moe_inter_size,1,0);
+    auto *fused_expert_i8=reinterpret_cast<int8_t *>(gpu_state.expert_bf16);
+    dsv2_launch_quantize_expert_activation_i8(fused_expert_i8,
+        gpu_state.expert_i8_scale,fused_expert_bf16,gpu_state.expert_counts,
+        c.n_routed_experts,capacity,c.moe_inter_size,0);
+    dsv2_launch_grouped_expert_gemm_i8(gpu_state.pexpert_up,fused_expert_i8,
+        reinterpret_cast<const int8_t *const *>(w.expert_down_i8_table),
+        reinterpret_cast<const float *const *>(w.expert_down_scale_table),
+        gpu_state.expert_i8_scale,gpu_state.expert_counts,gpu_state.expert_slots,
+        c.n_routed_experts,capacity,H,c.moe_inter_size,0);
     dsv2_launch_batched_weighted_add(output,gpu_state.pexpert_up,
                                      gpu_state.ptopk_weight,batch,K,H,0);
 }
@@ -837,6 +883,15 @@ void warm_up(Transformer *t) {
               "allocate sampled token");
     upload_model_weights(t);
     allocate_device_state(t);
+    lm_head_i8=device_allocate<int8_t>((size_t)t->config.vocab_size*
+        t->config.hidden_size,"allocate INT8 LM head");
+    lm_input_i8=device_allocate<int8_t>((size_t)MAX_REQUESTS*t->config.hidden_size,
+                                        "allocate INT8 LM input");
+    lm_head_scale=device_allocate<float>(t->config.vocab_size,
+                                         "allocate INT8 LM scales");
+    dsv2_launch_quantize_weight_i8(lm_head_i8,lm_head_scale,gpu_model.lm_head,
+        t->config.vocab_size,t->config.hidden_size,0);
+    prepare_int8_expert_down(t);
 }
 
 void finish(Transformer *t) {
@@ -851,6 +906,9 @@ void finish(Transformer *t) {
     gpu_aux_allocations.clear();
     gpu_model.arena = nullptr;
     device_token = nullptr;
+    lm_head_i8 = nullptr;
+    lm_input_i8 = nullptr;
+    lm_head_scale = nullptr;
     device_block_max = nullptr;
     device_logits = nullptr;
     (void)t;

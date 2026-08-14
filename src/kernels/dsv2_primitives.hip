@@ -411,6 +411,7 @@ __global__ void batched_bf16_matvec_kernel(
  * K value, and the four accumulators cover rows 4*(lane/16)+{0,1,2,3}. */
 using float4_acc = float __attribute__((ext_vector_type(4)));
 using float2_reg = float __attribute__((ext_vector_type(2)));
+using int4_acc = int __attribute__((ext_vector_type(4)));
 
 __device__ __forceinline__ uint16_t to_bf16_rne(float value){
     uint32_t bits=__float_as_uint(value);
@@ -420,6 +421,47 @@ __device__ __forceinline__ uint16_t to_bf16_rne(float value){
 __global__ void convert_bf16_kernel(uint16_t *output,const float *input,size_t n){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n)output[i]=to_bf16_rne(input[i]);
+}
+
+__global__ void quantize_weight_i8_kernel(int8_t *output,float *scales,
+    const uint16_t *input,int rows,int cols){
+    int row=blockIdx.x,lane=threadIdx.x&63,wave=threadIdx.x>>6;float m=0;
+    for(int k=threadIdx.x;k<cols;k+=blockDim.x)m=fmaxf(m,fabsf(load_bf16(input+(size_t)row*cols+k)));
+    for(int o=32;o;o>>=1)m=fmaxf(m,__shfl_down(m,o,64));
+    __shared__ float wm[4],scale;if(lane==0)wm[wave]=m;__syncthreads();
+    if(threadIdx.x==0){m=fmaxf(fmaxf(wm[0],wm[1]),fmaxf(wm[2],wm[3]));
+        scale=m>0?m/127.0f:1.0f;scales[row]=scale;}__syncthreads();
+    float inv=1.0f/scale;
+    for(int k=threadIdx.x;k<cols;k+=blockDim.x){int q=__float2int_rn(load_bf16(input+(size_t)row*cols+k)*inv);
+        output[(size_t)row*cols+k]=(int8_t)max(-127,min(127,q));}
+}
+
+__global__ void quantize_activation_i8_kernel(int8_t *output,const float *input,
+    int batch,int cols){
+    int token=blockIdx.x,lane=threadIdx.x&63,wave=threadIdx.x>>6;float m=0;
+    const float *x=input+(size_t)token*cols;
+    for(int k=threadIdx.x;k<cols;k+=blockDim.x)m=fmaxf(m,fabsf(x[k]));
+    for(int o=32;o;o>>=1)m=fmaxf(m,__shfl_down(m,o,64));
+    __shared__ float wm[4],inv;if(lane==0)wm[wave]=m;__syncthreads();
+    if(threadIdx.x==0){m=fmaxf(fmaxf(wm[0],wm[1]),fmaxf(wm[2],wm[3]));inv=m>0?127.0f/m:1.0f;}
+    __syncthreads();for(int k=threadIdx.x;k<cols;k+=blockDim.x){int q=__float2int_rn(x[k]*inv);
+        output[(size_t)token*cols+k]=(int8_t)max(-127,min(127,q));}
+}
+
+__global__ void quantize_expert_activation_i8_kernel(int8_t *output,float *scales,
+    const uint16_t *input,const int *counts,int experts,int capacity,int width){
+    int route=blockIdx.x,expert=route/capacity,slot=route%capacity;
+    if(expert>=experts||slot>=min(counts[expert],capacity))return;
+    int lane=threadIdx.x&63,wave=threadIdx.x>>6;float m=0;
+    const uint16_t *x=input+(size_t)route*width;
+    for(int k=threadIdx.x;k<width;k+=blockDim.x)m=fmaxf(m,fabsf(load_bf16(x+k)));
+    for(int o=32;o;o>>=1)m=fmaxf(m,__shfl_down(m,o,64));
+    __shared__ float wm[4],scale;if(lane==0)wm[wave]=m;__syncthreads();
+    if(threadIdx.x==0){m=fmaxf(fmaxf(wm[0],wm[1]),fmaxf(wm[2],wm[3]));
+        scale=m>0?m/127.0f:1.0f;scales[route]=scale;}__syncthreads();
+    float inv=1.0f/scale;for(int k=threadIdx.x;k<width;k+=blockDim.x){
+        int q=__float2int_rn(load_bf16(x+k)*inv);
+        output[(size_t)route*width+k]=(int8_t)max(-127,min(127,q));}
 }
 
 __global__ void mfma_f32_bf16_weight_gemm(float *output, const float *input,
@@ -620,6 +662,52 @@ __global__ void mfma_bf16_gemm_argmax_32x64(float *partial_value,int *partial_in
             float v0=wave_value[o0],v1=wave_value[o1];
             int i0=wave_index[o0],i1=wave_index[o1];
             if(v1>v0||(v1==v0&&i1<i0)){v0=v1;i0=i1;}
+            size_t o=(size_t)n*tiles+blockIdx.x;partial_value[o]=v0;partial_index[o]=i0;}}
+}
+
+__global__ void mfma_i8_gemm_argmax_32x64(float *partial_value,int *partial_index,
+    const int8_t *input,const int8_t *weight,const float *weight_scale,
+    int batch,int rows,int cols,int tiles){
+    int tid=threadIdx.x,lane=tid&63,wave=tid>>6;
+    int mt=wave&1,nt=wave>>1,tile_m=blockIdx.x*64,tile_n=blockIdx.y*64;
+    int kg=(lane>>4)*4;int4_acc acc0={0,0,0,0},acc1={0,0,0,0};
+    __shared__ int8_t as[2][1024],bs[2][1024];
+    __shared__ float wave_value[128];__shared__ int wave_index[128];
+    for(int z=tid;z<1024;z+=512){int r=z/16,k=z%16;
+        as[0][z]=tile_m+r<rows?weight[(size_t)(tile_m+r)*cols+k]:0;
+        int n=z/16;bs[0][z]=tile_n+n<batch?input[(size_t)(tile_n+n)*cols+k]:0;}
+    __syncthreads();
+    for(int kb=0;kb<cols;kb+=16){int cur=(kb>>4)&1,nxt=cur^1;
+        int ar0=(mt*16+(lane&15))*16+kg,ar1=((mt+2)*16+(lane&15))*16+kg;
+        int br=(nt*16+(lane&15))*16+kg;
+        int32_t av0=*reinterpret_cast<int32_t *>(as[cur]+ar0);
+        int32_t av1=*reinterpret_cast<int32_t *>(as[cur]+ar1);
+        int32_t bv=*reinterpret_cast<int32_t *>(bs[cur]+br);
+        int8_t na0=0,nb0=0,na1=0,nb1=0;
+        if(kb+16<cols){int k=tid&15,r=tid>>4,n=r;
+            if(tile_m+r<rows)na0=weight[(size_t)(tile_m+r)*cols+kb+16+k];
+            if(tile_n+n<batch)nb0=input[(size_t)(tile_n+n)*cols+kb+16+k];
+            r+=32;n+=32;
+            if(tile_m+r<rows)na1=weight[(size_t)(tile_m+r)*cols+kb+16+k];
+            if(tile_n+n<batch)nb1=input[(size_t)(tile_n+n)*cols+kb+16+k];}
+        acc0=__builtin_amdgcn_mfma_i32_16x16x16i8(av0,bv,acc0,0,0,0);
+        acc1=__builtin_amdgcn_mfma_i32_16x16x16i8(av1,bv,acc1,0,0,0);
+        if(kb+16<cols){as[nxt][tid]=na0;bs[nxt][tid]=nb0;
+            as[nxt][tid+512]=na1;bs[nxt][tid+512]=nb1;}
+        __syncthreads();}
+    int base0=tile_m+mt*16+(lane>>4)*4,base1=base0+32;
+    float best=-INFINITY;int best_i=rows;
+    for(int i=0;i<4;++i){if(base0+i<rows){float v=(float)acc0[i]*weight_scale[base0+i];
+            if(v>best||(v==best&&base0+i<best_i)){best=v;best_i=base0+i;}}
+        if(base1+i<rows){float v=(float)acc1[i]*weight_scale[base1+i];
+            if(v>best||(v==best&&base1+i<best_i)){best=v;best_i=base1+i;}}}
+    for(int offset=16;offset<=32;offset*=2){float ov=__shfl_down(best,offset,64);
+        int oi=__shfl_down(best_i,offset,64);if(lane+offset<64&&
+        (ov>best||(ov==best&&oi<best_i))){best=ov;best_i=oi;}}
+    if(lane<16){int o=wave*16+lane;wave_value[o]=best;wave_index[o]=best_i;}
+    __syncthreads();if(tid<64){int ntile=tid>>4,nlocal=tid&15,n=tile_n+ntile*16+nlocal;
+        if(n<batch){int o0=(ntile*2)*16+nlocal,o1=o0+16;float v0=wave_value[o0],v1=wave_value[o1];
+            int i0=wave_index[o0],i1=wave_index[o1];if(v1>v0||(v1==v0&&i1<i0)){v0=v1;i0=i1;}
             size_t o=(size_t)n*tiles+blockIdx.x;partial_value[o]=v0;partial_index[o]=i0;}}
 }
 
@@ -1160,6 +1248,49 @@ __global__ void grouped_expert_mfma_32x64(float *output,const uint16_t *input,
             output[(size_t)route*rows+r+i]=acc1[i];}}
 }
 
+__global__ void grouped_expert_i8_32x64(float *output,const int8_t *input,
+    const int8_t *const *weights,const float *const *weight_scales,
+    const float *activation_scales,const int *counts,const int *slots,
+    int capacity,int rows,int cols){
+    int expert=blockIdx.z,count=min(counts[expert],capacity);
+    if((int)blockIdx.y*64>=count)return;
+    int tid=threadIdx.x,lane=tid&63,wave=tid>>6,mt=wave&3,nt=wave>>2;
+    int tile_m=blockIdx.x*64,tile_n=blockIdx.y*64,kg=(lane>>4)*4;
+    int4_acc acc0={0,0,0,0},acc1={0,0,0,0};const int8_t *w=weights[expert];
+    const float *ws=weight_scales[expert];
+    const int8_t *x=input+(size_t)expert*capacity*cols;
+    __shared__ int8_t as[2][1024],bs[2][1024];
+    for(int z=tid;z<1024;z+=512){int r=z/16,k=z%16;
+        as[0][z]=tile_m+r<rows?w[(size_t)(tile_m+r)*cols+k]:0;
+        int n=z/16;bs[0][z]=tile_n+n<count?x[(size_t)(tile_n+n)*cols+k]:0;}
+    __syncthreads();
+    for(int kb=0;kb<cols;kb+=16){int cur=(kb>>4)&1,nxt=cur^1;
+        int ai=(mt*16+(lane&15))*16+kg;
+        int bi0=(nt*16+(lane&15))*16+kg,bi1=bi0+32*16;
+        int32_t av=*reinterpret_cast<int32_t *>(as[cur]+ai);
+        int32_t bv0=*reinterpret_cast<int32_t *>(bs[cur]+bi0);
+        int32_t bv1=*reinterpret_cast<int32_t *>(bs[cur]+bi1);
+        int8_t na0=0,nb0=0,na1=0,nb1=0;
+        if(kb+16<cols){int k=tid&15,r=tid>>4,n=r;
+            if(tile_m+r<rows)na0=w[(size_t)(tile_m+r)*cols+kb+16+k];
+            if(tile_n+n<count)nb0=x[(size_t)(tile_n+n)*cols+kb+16+k];
+            r+=32;n+=32;
+            if(tile_m+r<rows)na1=w[(size_t)(tile_m+r)*cols+kb+16+k];
+            if(tile_n+n<count)nb1=x[(size_t)(tile_n+n)*cols+kb+16+k];}
+        acc0=__builtin_amdgcn_mfma_i32_16x16x16i8(av,bv0,acc0,0,0,0);
+        acc1=__builtin_amdgcn_mfma_i32_16x16x16i8(av,bv1,acc1,0,0,0);
+        if(kb+16<cols){as[nxt][tid]=na0;bs[nxt][tid]=nb0;
+            as[nxt][tid+512]=na1;bs[nxt][tid+512]=nb1;}
+        __syncthreads();}
+    int r=tile_m+mt*16+(lane>>4)*4,n0=tile_n+nt*16+(lane&15),n1=n0+32;
+    for(int i=0;i<4;++i){if(n0<count&&r+i<rows){int route=slots[(size_t)expert*capacity+n0];
+            float s=activation_scales[(size_t)expert*capacity+n0]*ws[r+i];
+            output[(size_t)route*rows+r+i]=(float)acc0[i]*s;}
+        if(n1<count&&r+i<rows){int route=slots[(size_t)expert*capacity+n1];
+            float s=activation_scales[(size_t)expert*capacity+n1]*ws[r+i];
+            output[(size_t)route*rows+r+i]=(float)acc1[i]*s;}}
+}
+
 __global__ void grouped_expert_gate_up_32x64(uint16_t *gate,float *up,
     const uint16_t *input,const uint16_t *const *gate_w,
     const uint16_t *const *up_w,const int *counts,int capacity,int rows,int cols){
@@ -1502,6 +1633,17 @@ extern "C" void dsv2_launch_batched_lm_argmax_partials(float *values,int *indice
     mfma_bf16_gemm_argmax_32x64<<<dim3(tiles,(batch+63)/64),512,0,s>>>(
         values,indices,mfma_input,w,batch,vocab,cols,tiles);
 }
+extern "C" void dsv2_launch_quantize_weight_i8(int8_t *out,float *scales,
+    const uint16_t *in,int rows,int cols,hipStream_t s){
+    quantize_weight_i8_kernel<<<rows,256,0,s>>>(out,scales,in,rows,cols);
+}
+extern "C" void dsv2_launch_batched_lm_argmax_i8(float *values,int *indices,
+    const float *in,int8_t *quant_in,const int8_t *w,const float *scales,
+    int batch,int vocab,int cols,hipStream_t s){int tiles=(vocab+63)/64;
+    quantize_activation_i8_kernel<<<batch,256,0,s>>>(quant_in,in,batch,cols);
+    mfma_i8_gemm_argmax_32x64<<<dim3(tiles,(batch+63)/64),512,0,s>>>(
+        values,indices,quant_in,w,scales,batch,vocab,cols,tiles);
+}
 extern "C" void dsv2_launch_batched_swiglu_mfma(float *out,const float *in,
     const uint16_t *gate,const uint16_t *up,int batch,int rows,int cols,hipStream_t s){
     size_t total=(size_t)batch*cols;
@@ -1615,11 +1757,22 @@ extern "C" void dsv2_launch_convert_expert_bf16(uint16_t *out,const float *in,
     size_t total=(size_t)experts*capacity*width;
     convert_expert_bf16_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(
         out,in,counts,experts,capacity,width);}
+extern "C" void dsv2_launch_quantize_expert_activation_i8(int8_t *out,
+    float *scales,const uint16_t *in,const int *counts,int experts,int capacity,
+    int width,hipStream_t s){
+    quantize_expert_activation_i8_kernel<<<experts*capacity,256,0,s>>>(
+        out,scales,in,counts,experts,capacity,width);}
 extern "C" void dsv2_launch_grouped_expert_gemm(float *out,const uint16_t *in,
     const uint16_t *const *weights,const int *counts,const int *slots,int experts,
     int capacity,int rows,int cols,int input_mode,hipStream_t s){
     grouped_expert_mfma_32x64<<<dim3((rows+63)/64,(capacity+63)/64,experts),512,0,s>>>(
         out,in,weights,counts,slots,capacity,rows,cols);}
+extern "C" void dsv2_launch_grouped_expert_gemm_i8(float *out,const int8_t *in,
+    const int8_t *const *weights,const float *const *weight_scales,
+    const float *activation_scales,const int *counts,const int *slots,int experts,
+    int capacity,int rows,int cols,hipStream_t s){
+    grouped_expert_i8_32x64<<<dim3((rows+63)/64,(capacity+63)/64,experts),512,0,s>>>(
+        out,in,weights,weight_scales,activation_scales,counts,slots,capacity,rows,cols);}
 extern "C" void dsv2_launch_grouped_expert_gate_up(uint16_t *gate,float *up,
     const uint16_t *in,const uint16_t *const *gate_w,const uint16_t *const *up_w,
     const int *counts,int experts,int capacity,int rows,int cols,hipStream_t s){
