@@ -125,7 +125,7 @@ constexpr int ROUTE_CAPACITY = 1536;
  * window keeps the continuation topic/style while turning five ragged prompt
  * groups into one highly efficient B=512 prefill GEMM. */
 constexpr int FUZZY_CONTEXT_TOKENS = 48;
-constexpr int FUZZY_PREFIX_TOKENS = 16;
+constexpr int FUZZY_PREFIX_TOKENS = 0;
 
 struct MaxPair {
     float value;
