@@ -75,18 +75,18 @@ void dsv2_launch_prefill_unabsorbed(float *,float *,float *,const float *,const 
 void dsv2_launch_batched_router_topk(const float *,int,int,int,int *,float *,hipStream_t);
 void dsv2_launch_expand_selected(float *,const float *,int,int,int,hipStream_t);
 void dsv2_launch_batched_weighted_add(float *,const float *,const float *,int,int,int,hipStream_t);
-void dsv2_launch_bucket_routes(const int *,const float *,int,int,int *,int *,
-                               float *,int,hipStream_t);
-void dsv2_launch_pack_expert_bf16(uint16_t *,const float *,const int *,const int *,
-                                  int,int,int,hipStream_t);
+void dsv2_launch_bucket_routes(const int *,int,int,int *,int *,int *,int *,int *,
+                               int *,int,hipStream_t);
+void dsv2_launch_pack_expert_bf16(uint16_t *,const float *,const int *,int,int,
+                                  hipStream_t);
 void dsv2_launch_convert_expert_bf16(uint16_t *,const float *,const int *,int,int,
                                      int,hipStream_t);
 void dsv2_launch_grouped_expert_gemm(float *,const uint16_t *,
-    const uint16_t *const *,const int *,const int *,int,int,int,int,int,
-    hipStream_t);
+    const uint16_t *const *,const int *,const int *,const int *,const int *,
+    const int *,int,int,int,hipStream_t);
 void dsv2_launch_grouped_expert_gate_up(uint16_t *,float *,const uint16_t *,
-    const uint16_t *const *,const uint16_t *const *,const int *,int,int,int,int,
-    hipStream_t);
+    const uint16_t *const *,const uint16_t *const *,const int *,const int *,
+    const int *,const int *,int,int,int,hipStream_t);
 void dsv2_launch_single_gate_up(uint16_t *,const uint16_t *,const uint16_t *,
     const uint16_t *,int,int,int,hipStream_t);
 void dsv2_launch_bf16_input_matvec(float *,const uint16_t *,const uint16_t *,
@@ -116,6 +116,7 @@ constexpr int MAX_REQUESTS = 512;
 constexpr int CACHE_SEQUENCE = 320;
 constexpr int PREFILL_CAPACITY = 40960;
 constexpr int ROUTE_CAPACITY = 1536;
+constexpr int MAX_ROUTE_TILES = 2048;
 /* The scoring tier is semantic rather than token-exact.  A recent-context
  * window keeps the continuation topic/style while turning five ragged prompt
  * groups into one highly efficient B=512 prefill GEMM. */
@@ -178,7 +179,9 @@ struct DeviceState {
           *pexpert_up = nullptr, *pexpert_output = nullptr;
     int *ptopk_index = nullptr;
     float *ptopk_weight = nullptr;
-    int *expert_counts = nullptr, *expert_slots = nullptr;
+    int *expert_counts = nullptr, *expert_offsets = nullptr,
+        *expert_cursors = nullptr, *expert_slots = nullptr,
+        *expert_tile_experts = nullptr, *expert_tile_starts = nullptr;
     float *expert_slot_weights = nullptr;
     uint16_t *expert_bf16 = nullptr;
 };
@@ -411,8 +414,16 @@ void allocate_device_state(Transformer *t) {
     gpu_state.ptopk_weight = device_allocate<float>(B * K, "allocate prefill topk weight");
     gpu_state.expert_counts = device_allocate<int>(c.n_routed_experts,
                                                    "allocate expert counts");
-    gpu_state.expert_slots = device_allocate<int>((size_t)c.n_routed_experts *
-        ROUTE_CAPACITY, "allocate expert slots");
+    gpu_state.expert_offsets = device_allocate<int>(c.n_routed_experts+1,
+                                                    "allocate expert offsets");
+    gpu_state.expert_cursors = device_allocate<int>(c.n_routed_experts,
+                                                    "allocate expert cursors");
+    gpu_state.expert_slots = device_allocate<int>((size_t)B*K,
+                                                  "allocate compact expert slots");
+    gpu_state.expert_tile_experts = device_allocate<int>(MAX_ROUTE_TILES,
+                                                   "allocate expert tile ids");
+    gpu_state.expert_tile_starts = device_allocate<int>(MAX_ROUTE_TILES,
+                                                   "allocate expert tile starts");
     gpu_state.expert_slot_weights = device_allocate<float>(
         (size_t)c.n_routed_experts * ROUTE_CAPACITY,"allocate expert route weights");
     gpu_state.expert_bf16 = device_allocate<uint16_t>(
@@ -611,25 +622,27 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
                                c.n_routed_experts,H,0);
     dsv2_launch_batched_router_topk(gpu_state.prouter,batch,c.n_routed_experts,K,
                                     gpu_state.ptopk_index,gpu_state.ptopk_weight,0);
-    int capacity=std::min(ROUTE_CAPACITY,std::max(128,
-        (batch*K+c.n_routed_experts-1)/c.n_routed_experts*5));
-    dsv2_launch_bucket_routes(gpu_state.ptopk_index,gpu_state.ptopk_weight,batch,K,
-        gpu_state.expert_counts,gpu_state.expert_slots,
-        gpu_state.expert_slot_weights,capacity,0);
+    int routes=batch*K,max_tiles=(routes+127)/128+c.n_routed_experts;
+    dsv2_launch_bucket_routes(gpu_state.ptopk_index,batch,K,
+        gpu_state.expert_counts,gpu_state.expert_offsets,gpu_state.expert_cursors,
+        gpu_state.expert_slots,gpu_state.expert_tile_experts,
+        gpu_state.expert_tile_starts,max_tiles,0);
     dsv2_launch_pack_expert_bf16(gpu_state.expert_bf16,input,
-        gpu_state.expert_counts,gpu_state.expert_slots,c.n_routed_experts,
-        capacity,H,0);
+        gpu_state.expert_slots,routes,H,0);
     auto *fused_expert_bf16=reinterpret_cast<uint16_t *>(gpu_state.pexpert_gate);
     dsv2_launch_grouped_expert_gate_up(fused_expert_bf16,gpu_state.pexpert_up,
         gpu_state.expert_bf16,
         reinterpret_cast<const uint16_t *const *>(w.expert_gate_table),
         reinterpret_cast<const uint16_t *const *>(w.expert_up_table),
-        gpu_state.expert_counts,c.n_routed_experts,capacity,c.moe_inter_size,H,0);
+        gpu_state.expert_counts,gpu_state.expert_offsets,
+        gpu_state.expert_tile_experts,gpu_state.expert_tile_starts,max_tiles,
+        c.moe_inter_size,H,0);
     dsv2_launch_grouped_expert_gemm(gpu_state.pexpert_up,
         fused_expert_bf16,
         reinterpret_cast<const uint16_t *const *>(w.expert_down_table),
-        gpu_state.expert_counts,gpu_state.expert_slots,c.n_routed_experts,
-        capacity,H,c.moe_inter_size,1,0);
+        gpu_state.expert_counts,gpu_state.expert_slots,gpu_state.expert_offsets,
+        gpu_state.expert_tile_experts,gpu_state.expert_tile_starts,max_tiles,
+        H,c.moe_inter_size,0);
     hip_check(hipEventRecord(shared_expert_done,shared_expert_stream),
               "record shared expert completion");
     hip_check(hipStreamWaitEvent(0,shared_expert_done,0),

@@ -1096,21 +1096,33 @@ __global__ void batched_router_topk_kernel(const float *logits, int batch,
             weights[(size_t)token*topk+rank]=best_value;}if(e==best)score=-INFINITY;}
 }
 
-__global__ void bucket_routes_kernel(const int *indices,const float *weights,
-    int tokens,int topk,int *counts,int *slots,float *slot_weights,int capacity){
-    int route=blockIdx.x*blockDim.x+threadIdx.x,total=tokens*topk;
-    if(route>=total)return;int expert=indices[route];
-    int slot=atomicAdd(counts+expert,1);
-    if(slot<capacity){slots[(size_t)expert*capacity+slot]=route;
-        slot_weights[(size_t)expert*capacity+slot]=weights[route];}
+__global__ void route_histogram_kernel(const int *indices,int total,int *counts){
+    int route=blockIdx.x*blockDim.x+threadIdx.x;
+    if(route<total)atomicAdd(counts+indices[route],1);
+}
+
+__global__ void route_prefix_descriptors_kernel(const int *counts,int *offsets,
+    int *cursors,int *tile_experts,int *tile_starts,int experts,int max_tiles){
+    if(threadIdx.x==0){int offset=0,descriptor=0;
+        for(int e=0;e<experts;++e){offsets[e]=offset;cursors[e]=0;
+            for(int s=0;s<counts[e];s+=128){tile_experts[descriptor]=e;
+                tile_starts[descriptor++]=s;}offset+=counts[e];}
+        offsets[experts]=offset;
+        for(int d=descriptor;d<max_tiles;++d)tile_experts[d]=-1;}
+}
+
+__global__ void route_scatter_kernel(const int *indices,int total,
+    const int *offsets,int *cursors,int *slots){
+    int route=blockIdx.x*blockDim.x+threadIdx.x;
+    if(route<total){int expert=indices[route];int local=atomicAdd(cursors+expert,1);
+        slots[offsets[expert]+local]=route;}
 }
 
 __global__ void pack_expert_bf16_kernel(uint16_t *output,const float *input,
-    const int *counts,const int *slots,int experts,int capacity,int hidden){
+    const int *slots,int routes,int hidden){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
-    int quads=hidden/4;size_t total=(size_t)experts*capacity*quads;if(i>=total)return;
-    int hq=i%quads,route=i/quads,expert=route/capacity,slot=route%capacity;
-    if(slot<min(counts[expert],capacity)){int h=hq*4,token=slots[route]/6;
+    int quads=hidden/4;size_t total=(size_t)routes*quads;if(i>=total)return;
+    int hq=i%quads,route=i/quads;{int h=hq*4,token=slots[route]/6;
         const float *src=input+(size_t)token*hidden+h;
         uint32_t packed0=(uint32_t)to_bf16_rne(src[0])|
                          ((uint32_t)to_bf16_rne(src[1])<<16);
@@ -1214,14 +1226,15 @@ __global__ void grouped_expert_mfma_32x64(float *output,const uint16_t *input,
 
 __global__ void grouped_expert_mfma_64x128(float *output,const uint16_t *input,
     const uint16_t *const *weights,const int *counts,const int *slots,
-    int capacity,int rows,int cols){
-    int expert=blockIdx.z,count=min(counts[expert],capacity);
-    if((int)blockIdx.y*128>=count)return;
+    const int *offsets,const int *tile_experts,const int *tile_starts,
+    int rows,int cols){
+    int descriptor=blockIdx.y,expert=tile_experts[descriptor];if(expert<0)return;
+    int count=counts[expert],offset=offsets[expert];
     int tid=threadIdx.x,lane=tid&63,wave=tid>>6,mt=wave&1,nt=wave>>1;
-    int tile_m=blockIdx.x*64,tile_n=blockIdx.y*128,kg=(lane>>4)*4;
+    int tile_m=blockIdx.x*64,tile_n=tile_starts[descriptor],kg=(lane>>4)*4;
     float4_acc a0={0,0,0,0},a1={0,0,0,0},b0={0,0,0,0},b1={0,0,0,0};
     const uint16_t *w=weights[expert];
-    const uint16_t *x=input+(size_t)expert*capacity*cols;
+    const uint16_t *x=input+(size_t)offset*cols;
     __shared__ uint16_t as[2][1024],bs[2][2048];
     for(int z=tid;z<1024;z+=512){int r=z/16,k=z%16;
         as[0][z]=tile_m+r<rows?w[(size_t)(tile_m+r)*cols+k]:0;
@@ -1258,8 +1271,8 @@ __global__ void grouped_expert_mfma_64x128(float *output,const uint16_t *input,
         __syncthreads();}
     int r0=tile_m+mt*16+(lane>>4)*4,r1=r0+32;
     int n0=tile_n+nt*16+(lane&15),n1=n0+64;
-    int route0=n0<count?slots[(size_t)expert*capacity+n0]:0;
-    int route1=n1<count?slots[(size_t)expert*capacity+n1]:0;
+    int route0=n0<count?slots[offset+n0]:0;
+    int route1=n1<count?slots[offset+n1]:0;
     #pragma unroll
     for(int i=0;i<4;++i){
         if(n0<count&&r0+i<rows)output[(size_t)route0*rows+r0+i]=a0[i];
@@ -1270,17 +1283,20 @@ __global__ void grouped_expert_mfma_64x128(float *output,const uint16_t *input,
 
 __global__ void grouped_expert_gate_up_32x128(uint16_t *gate,float *up,
     const uint16_t *input,const uint16_t *const *gate_w,
-    const uint16_t *const *up_w,const int *counts,int capacity,int rows,int cols,
+    const uint16_t *const *up_w,const int *counts,const int *offsets,
+    const int *tile_experts,const int *tile_starts,int capacity,int rows,int cols,
     int single_count){
-    int expert=blockIdx.z,count=single_count>=0?single_count:min(counts[expert],capacity);
-    if((int)blockIdx.y*128>=count)return;
+    int expert=single_count>=0?0:tile_experts[blockIdx.y];if(expert<0)return;
+    int count=single_count>=0?single_count:counts[expert];
+    int offset=single_count>=0?0:offsets[expert];
     int tid=threadIdx.x,lane=tid&63,wave=tid>>6,mt=wave&1,nt=wave>>1;
-    int tile_m=blockIdx.x*64,tile_n=blockIdx.y*128,kg=(lane>>4)*4;
+    int tile_m=blockIdx.x*64,tile_n=single_count>=0?blockIdx.y*128:
+        tile_starts[blockIdx.y],kg=(lane>>4)*4;
     float4_acc ag0={0,0,0,0},au0={0,0,0,0},ag1={0,0,0,0},au1={0,0,0,0};
     float4_acc bg0={0,0,0,0},bu0={0,0,0,0},bg1={0,0,0,0},bu1={0,0,0,0};
     const uint16_t *wg=single_count>=0?reinterpret_cast<const uint16_t *>(gate_w):gate_w[expert];
     const uint16_t *wu=single_count>=0?reinterpret_cast<const uint16_t *>(up_w):up_w[expert];
-    const uint16_t *x=input+(size_t)expert*capacity*cols;
+    const uint16_t *x=input+(size_t)offset*cols;
     __shared__ uint16_t gs[2][1024],us[2][1024],bs[2][2048];
     for(int z=tid;z<1024;z+=512){int r=z/16,k=z%16;
         if(tile_m+r<rows){gs[0][z]=wg[(size_t)(tile_m+r)*cols+k];
@@ -1330,13 +1346,13 @@ __global__ void grouped_expert_gate_up_32x128(uint16_t *gate,float *up,
         __syncthreads();}
     int r0=tile_m+mt*16+(lane>>4)*4,r1=r0+32,n=tile_n+nt*16+(lane&15),n2=n+64;
     #pragma unroll
-    for(int i=0;i<4;++i){if(n<count&&r0+i<rows){size_t o=((size_t)expert*capacity+n)*rows+r0+i;
+    for(int i=0;i<4;++i){if(n<count&&r0+i<rows){size_t o=((size_t)offset+n)*rows+r0+i;
         float g=ag0[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*au0[i]);}
-        if(n<count&&r1+i<rows){size_t o=((size_t)expert*capacity+n)*rows+r1+i;
+        if(n<count&&r1+i<rows){size_t o=((size_t)offset+n)*rows+r1+i;
         float g=ag1[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*au1[i]);}
-        if(n2<count&&r0+i<rows){size_t o=((size_t)expert*capacity+n2)*rows+r0+i;
+        if(n2<count&&r0+i<rows){size_t o=((size_t)offset+n2)*rows+r0+i;
         float g=bg0[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*bu0[i]);}
-        if(n2<count&&r1+i<rows){size_t o=((size_t)expert*capacity+n2)*rows+r1+i;
+        if(n2<count&&r1+i<rows){size_t o=((size_t)offset+n2)*rows+r1+i;
         float g=bg1[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*bu1[i]);}}
 }
 
@@ -1738,38 +1754,46 @@ extern "C" void dsv2_launch_expand_selected(float *out,const float *in,int batch
     int total=batch*topk*hidden;expand_selected_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(out,in,batch,topk,hidden);}
 extern "C" void dsv2_launch_batched_weighted_add(float *out,const float *experts,const float *weights,int batch,int topk,int hidden,hipStream_t s){
     int total=batch*(hidden/4);batched_weighted_add_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(out,experts,weights,batch,topk,hidden);}
-extern "C" void dsv2_launch_bucket_routes(const int *idx,const float *weights,
-    int tokens,int topk,int *counts,int *slots,float *slot_weights,int capacity,
-    hipStream_t s){
+extern "C" void dsv2_launch_bucket_routes(const int *idx,int tokens,int topk,
+    int *counts,int *offsets,int *cursors,int *slots,int *tile_experts,
+    int *tile_starts,int max_tiles,hipStream_t s){
     hipMemsetAsync(counts,0,64*sizeof(int),s);int total=tokens*topk;
-    bucket_routes_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(
-        idx,weights,tokens,topk,counts,slots,slot_weights,capacity);}
+    route_histogram_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(
+        idx,total,counts);
+    route_prefix_descriptors_kernel<<<1,64,0,s>>>(counts,offsets,cursors,
+        tile_experts,tile_starts,64,max_tiles);
+    route_scatter_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(
+        idx,total,offsets,cursors,slots);}
 extern "C" void dsv2_launch_pack_expert_bf16(uint16_t *out,const float *in,
-    const int *counts,const int *slots,int experts,int capacity,int hidden,
-    hipStream_t s){size_t total=(size_t)experts*capacity*(hidden/4);
+    const int *slots,int routes,int hidden,hipStream_t s){
+    size_t total=(size_t)routes*(hidden/4);
     pack_expert_bf16_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(
-        out,in,counts,slots,experts,capacity,hidden);}
+        out,in,slots,routes,hidden);}
 extern "C" void dsv2_launch_convert_expert_bf16(uint16_t *out,const float *in,
     const int *counts,int experts,int capacity,int width,hipStream_t s){
     size_t total=(size_t)experts*capacity*width;
     convert_expert_bf16_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(
         out,in,counts,experts,capacity,width);}
 extern "C" void dsv2_launch_grouped_expert_gemm(float *out,const uint16_t *in,
-    const uint16_t *const *weights,const int *counts,const int *slots,int experts,
-    int capacity,int rows,int cols,int input_mode,hipStream_t s){
-    grouped_expert_mfma_64x128<<<dim3((rows+63)/64,(capacity+127)/128,experts),512,0,s>>>(
-        out,in,weights,counts,slots,capacity,rows,cols);}
+    const uint16_t *const *weights,const int *counts,const int *slots,
+    const int *offsets,const int *tile_experts,const int *tile_starts,
+    int max_tiles,int rows,int cols,hipStream_t s){
+    grouped_expert_mfma_64x128<<<dim3((rows+63)/64,max_tiles),512,0,s>>>(
+        out,in,weights,counts,slots,offsets,tile_experts,tile_starts,rows,cols);}
 extern "C" void dsv2_launch_grouped_expert_gate_up(uint16_t *gate,float *up,
     const uint16_t *in,const uint16_t *const *gate_w,const uint16_t *const *up_w,
-    const int *counts,int experts,int capacity,int rows,int cols,hipStream_t s){
-    grouped_expert_gate_up_32x128<<<dim3((rows+63)/64,(capacity+127)/128,experts),
-        512,0,s>>>(gate,up,in,gate_w,up_w,counts,capacity,rows,cols,-1);}
+    const int *counts,const int *offsets,const int *tile_experts,
+    const int *tile_starts,int max_tiles,int rows,int cols,hipStream_t s){
+    grouped_expert_gate_up_32x128<<<dim3((rows+63)/64,max_tiles),512,0,s>>>(
+        gate,up,in,gate_w,up_w,counts,offsets,tile_experts,tile_starts,0,
+        rows,cols,-1);}
 extern "C" void dsv2_launch_single_gate_up(uint16_t *gate,const uint16_t *in,
     const uint16_t *gate_w,const uint16_t *up_w,int batch,int rows,int cols,
     hipStream_t s){
     grouped_expert_gate_up_32x128<<<dim3((rows+63)/64,(batch+127)/128,1),512,0,s>>>(
         gate,nullptr,in?in:mfma_input,reinterpret_cast<const uint16_t *const *>(gate_w),
-        reinterpret_cast<const uint16_t *const *>(up_w),nullptr,batch,rows,cols,batch);}
+        reinterpret_cast<const uint16_t *const *>(up_w),nullptr,nullptr,nullptr,
+        nullptr,batch,rows,cols,batch);}
 extern "C" void dsv2_launch_bf16_input_matvec(float *out,const uint16_t *in,
     const uint16_t *w,int batch,int rows,int cols,hipStream_t s){
     if(batch>=96)
