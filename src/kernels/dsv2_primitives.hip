@@ -510,6 +510,55 @@ __global__ void mfma_bf16_gemm_32x64(float *output,const uint16_t *input,
         if(n1<batch&&r+i<rows)output[(size_t)n1*rows+r+i]=acc1[i];}
 }
 
+__global__ void mfma_bf16_gemm_64x128(float *output,const uint16_t *input,
+    const uint16_t *weight,int batch,int rows,int cols){
+    int tid=threadIdx.x,lane=tid&63,wave=tid>>6,mt=wave&1,nt=wave>>1;
+    int tile_m=blockIdx.x*64,tile_n=blockIdx.y*128,kg=(lane>>4)*4;
+    float4_acc a0={0,0,0,0},a1={0,0,0,0},b0={0,0,0,0},b1={0,0,0,0};
+    __shared__ uint16_t as[2][1024],bs[2][2048];
+    for(int z=tid;z<1024;z+=512){int r=z/16,k=z%16;
+        as[0][z]=tile_m+r<rows?weight[(size_t)(tile_m+r)*cols+k]:0;
+        int n=z/16;bs[0][z]=tile_n+n<batch?input[(size_t)(tile_n+n)*cols+k]:0;
+        n+=64;bs[0][z+1024]=tile_n+n<batch?input[(size_t)(tile_n+n)*cols+k]:0;}
+    __syncthreads();
+    for(int kb=0;kb<cols;kb+=16){int cur=(kb>>4)&1,nxt=cur^1;
+        int ai0=(mt*16+(lane&15))*16+kg,ai1=ai0+32*16;
+        int bi=(nt*16+(lane&15))*16+kg,bi2=bi+64*16;
+        float2_reg av0={__uint_as_float(*reinterpret_cast<uint32_t *>(as[cur]+ai0)),
+                        __uint_as_float(*reinterpret_cast<uint32_t *>(as[cur]+ai0+2))};
+        float2_reg av1={__uint_as_float(*reinterpret_cast<uint32_t *>(as[cur]+ai1)),
+                        __uint_as_float(*reinterpret_cast<uint32_t *>(as[cur]+ai1+2))};
+        float2_reg bv0={__uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi)),
+                        __uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi+2))};
+        float2_reg bv1={__uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi2)),
+                        __uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi2+2))};
+        uint16_t na0=0,na1=0,nb0=0,nb1=0,nb2=0,nb3=0;
+        if(kb+16<cols){int k=tid&15,r=tid>>4,n=r;
+            if(tile_m+r<rows)na0=weight[(size_t)(tile_m+r)*cols+kb+16+k];
+            if(tile_n+n<batch)nb0=input[(size_t)(tile_n+n)*cols+kb+16+k];
+            r+=32;n+=32;
+            if(tile_m+r<rows)na1=weight[(size_t)(tile_m+r)*cols+kb+16+k];
+            if(tile_n+n<batch)nb1=input[(size_t)(tile_n+n)*cols+kb+16+k];
+            n=(tid>>4)+64;if(tile_n+n<batch)nb2=input[(size_t)(tile_n+n)*cols+kb+16+k];
+            n+=32;if(tile_n+n<batch)nb3=input[(size_t)(tile_n+n)*cols+kb+16+k];}
+        a0=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av0,bv0,a0,0,0,0);
+        a1=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av1,bv0,a1,0,0,0);
+        b0=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av0,bv1,b0,0,0,0);
+        b1=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av1,bv1,b1,0,0,0);
+        if(kb+16<cols){as[nxt][tid]=na0;bs[nxt][tid]=nb0;
+            as[nxt][tid+512]=na1;bs[nxt][tid+512]=nb1;
+            bs[nxt][tid+1024]=nb2;bs[nxt][tid+1536]=nb3;}
+        __syncthreads();}
+    int r0=tile_m+mt*16+(lane>>4)*4,r1=r0+32;
+    int n0=tile_n+nt*16+(lane&15),n1=n0+64;
+    #pragma unroll
+    for(int i=0;i<4;++i){
+        if(n0<batch&&r0+i<rows)output[(size_t)n0*rows+r0+i]=a0[i];
+        if(n0<batch&&r1+i<rows)output[(size_t)n0*rows+r1+i]=a1[i];
+        if(n1<batch&&r0+i<rows)output[(size_t)n1*rows+r0+i]=b0[i];
+        if(n1<batch&&r1+i<rows)output[(size_t)n1*rows+r1+i]=b1[i];}
+}
+
 __global__ void pack_head_bf16(uint16_t *output,const float *input,int batch,
     int heads,int input_stride,int cols){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x,total=(size_t)batch*heads*cols;
@@ -1495,8 +1544,12 @@ extern "C" void dsv2_launch_batched_matvec(float *out,const float *in,const uint
         if(total<=mfma_input_capacity){
             convert_bf16_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(
                 mfma_input,in,total);
-        mfma_bf16_gemm_32x64<<<dim3((rows+63)/64,(batch+63)/64),512,0,s>>>(
-            out,mfma_input,w,batch,rows,cols);
+        if(batch>=96)
+            mfma_bf16_gemm_64x128<<<dim3((rows+63)/64,(batch+127)/128),512,0,s>>>(
+                out,mfma_input,w,batch,rows,cols);
+        else
+            mfma_bf16_gemm_32x64<<<dim3((rows+63)/64,(batch+63)/64),512,0,s>>>(
+                out,mfma_input,w,batch,rows,cols);
             return;
         }
     }
@@ -1510,8 +1563,12 @@ extern "C" void dsv2_prepare_batched_bf16(const float *in,int batch,int cols,
 }
 extern "C" void dsv2_launch_prepared_matvec(float *out,const uint16_t *w,
     int batch,int rows,int cols,hipStream_t s){
-    mfma_bf16_gemm_32x64<<<dim3((rows+63)/64,(batch+63)/64),512,0,s>>>(
-        out,mfma_input,w,batch,rows,cols);
+    if(batch>=96)
+        mfma_bf16_gemm_64x128<<<dim3((rows+63)/64,(batch+127)/128),512,0,s>>>(
+            out,mfma_input,w,batch,rows,cols);
+    else
+        mfma_bf16_gemm_32x64<<<dim3((rows+63)/64,(batch+63)/64),512,0,s>>>(
+            out,mfma_input,w,batch,rows,cols);
 }
 extern "C" void dsv2_launch_prepared_swiglu(float *out,const uint16_t *gate,
     const uint16_t *up,int batch,int rows,int cols,hipStream_t s){

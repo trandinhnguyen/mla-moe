@@ -599,7 +599,7 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
                                 SHARED,H,0);
     dsv2_launch_batched_matvec(output,gpu_state.phb,w.shared_down,batch,H,SHARED,0);
     int capacity=std::min(ROUTE_CAPACITY,std::max(128,
-        (batch*K+c.n_routed_experts-1)/c.n_routed_experts*4));
+        (batch*K+c.n_routed_experts-1)/c.n_routed_experts*5));
     dsv2_launch_bucket_routes(gpu_state.ptopk_index,gpu_state.ptopk_weight,batch,K,
         gpu_state.expert_counts,gpu_state.expert_slots,
         gpu_state.expert_slot_weights,capacity,0);
