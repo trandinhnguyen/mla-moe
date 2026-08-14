@@ -3,7 +3,7 @@
  * row 0 / head 0; row_stride/head_stride locate row blockIdx.x / head
  * blockIdx.y. pos for row r is pos_base + r (prefill: pos_base=0, r=p;
  * decode: pos_base=pos, n_rows=1). */
-#include "../kernels.h"
+#include "kernels.h"
 
 __global__ void rope_kernel(float *v, int n_heads, int row_stride,
                             int head_stride, int pos_base, int rope_dim,

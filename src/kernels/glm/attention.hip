@@ -4,7 +4,7 @@
  *  - absorbed (decode): W_UK folded into the query, attention in latent space
  *    (attn_absorbed_{score,clat}_kernel); softmax_row_kernel (elementwise.hip)
  *    handles the softmax step for both paths. */
-#include "../kernels.h"
+#include "kernels.h"
 
 #define ATTN_THREADS 256
 __device__ __forceinline__ float attn_block_reduce_sum(float val) {

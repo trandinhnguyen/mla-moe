@@ -1,7 +1,7 @@
 /* Embedding lookup, RMSNorm, residual/elementwise ops, and a generic causal-
  * aware row softmax. All mirror the scalar CPU reference in src/run.c op for
  * op (same reduction order per row) so results stay within eval tolerance. */
-#include "../kernels.h"
+#include "kernels.h"
 
 #define REDUCE_THREADS 256
 

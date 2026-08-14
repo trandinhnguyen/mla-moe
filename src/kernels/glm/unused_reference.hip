@@ -18,7 +18,7 @@
  *                                       moe_route_batched_kernel
  *   weighted_reduce / softmax_row / zero -> unused elementwise helpers
  * ========================================================================== */
-#include "../kernels.h"
+#include "kernels.h"
 
 
 /* ---- from attention.hip ---- */
