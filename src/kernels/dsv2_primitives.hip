@@ -1059,13 +1059,16 @@ __global__ void bucket_routes_kernel(const int *indices,const float *weights,
 __global__ void pack_expert_bf16_kernel(uint16_t *output,const float *input,
     const int *counts,const int *slots,int experts,int capacity,int hidden){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
-    int pairs=hidden/2;size_t total=(size_t)experts*capacity*pairs;if(i>=total)return;
-    int hp=i%pairs,route=i/pairs,expert=route/capacity,slot=route%capacity;
-    if(slot<min(counts[expert],capacity)){int h=hp*2,token=slots[route]/6;
+    int quads=hidden/4;size_t total=(size_t)experts*capacity*quads;if(i>=total)return;
+    int hq=i%quads,route=i/quads,expert=route/capacity,slot=route%capacity;
+    if(slot<min(counts[expert],capacity)){int h=hq*4,token=slots[route]/6;
         const float *src=input+(size_t)token*hidden+h;
-        uint32_t packed=(uint32_t)to_bf16_rne(src[0])|
-                        ((uint32_t)to_bf16_rne(src[1])<<16);
-        *reinterpret_cast<uint32_t *>(output+(size_t)route*hidden+h)=packed;}
+        uint32_t packed0=(uint32_t)to_bf16_rne(src[0])|
+                         ((uint32_t)to_bf16_rne(src[1])<<16);
+        uint32_t packed1=(uint32_t)to_bf16_rne(src[2])|
+                         ((uint32_t)to_bf16_rne(src[3])<<16);
+        uint2 packed={packed0,packed1};
+        *reinterpret_cast<uint2 *>(output+(size_t)route*hidden+h)=packed;}
 }
 
 __global__ void convert_expert_bf16_kernel(uint16_t *output,const float *input,
@@ -1256,11 +1259,14 @@ __global__ void expand_selected_kernel(float *output,const float *input,
 __global__ void batched_weighted_add_kernel(float *output,const float *experts,
                                             const float *weights,int batch,
                                             int topk,int hidden){
-    int i=blockIdx.x*blockDim.x+threadIdx.x,total=batch*hidden;if(i>=total)return;
-    int token=i/hidden,col=i%hidden;float v=output[i];
-    for(int r=0;r<topk;++r)
-        v+=weights[(size_t)token*topk+r]*experts[((size_t)token*topk+r)*hidden+col];
-    output[i]=v;
+    int i=blockIdx.x*blockDim.x+threadIdx.x,quads=hidden/4,total=batch*quads;
+    if(i>=total)return;int token=i/quads,col=(i%quads)*4;
+    float4 v=*reinterpret_cast<const float4 *>(output+(size_t)token*hidden+col);
+    #pragma unroll
+    for(int r=0;r<6;++r){float w=weights[(size_t)token*topk+r];
+        float4 e=*reinterpret_cast<const float4 *>(experts+((size_t)token*topk+r)*hidden+col);
+        v.x+=w*e.x;v.y+=w*e.y;v.z+=w*e.z;v.w+=w*e.w;}
+    *reinterpret_cast<float4 *>(output+(size_t)token*hidden+col)=v;
 }
 
 __global__ void dual_silu_matvec_kernel(float *output,const float *input,
@@ -1616,7 +1622,7 @@ extern "C" void dsv2_launch_batched_router_topk(const float *logits,int batch,in
 extern "C" void dsv2_launch_expand_selected(float *out,const float *in,int batch,int topk,int hidden,hipStream_t s){
     int total=batch*topk*hidden;expand_selected_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(out,in,batch,topk,hidden);}
 extern "C" void dsv2_launch_batched_weighted_add(float *out,const float *experts,const float *weights,int batch,int topk,int hidden,hipStream_t s){
-    int total=batch*hidden;batched_weighted_add_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(out,experts,weights,batch,topk,hidden);}
+    int total=batch*(hidden/4);batched_weighted_add_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(out,experts,weights,batch,topk,hidden);}
 extern "C" void dsv2_launch_bucket_routes(const int *idx,const float *weights,
     int tokens,int topk,int *counts,int *slots,float *slot_weights,int capacity,
     hipStream_t s){
@@ -1625,7 +1631,7 @@ extern "C" void dsv2_launch_bucket_routes(const int *idx,const float *weights,
         idx,weights,tokens,topk,counts,slots,slot_weights,capacity);}
 extern "C" void dsv2_launch_pack_expert_bf16(uint16_t *out,const float *in,
     const int *counts,const int *slots,int experts,int capacity,int hidden,
-    hipStream_t s){size_t total=(size_t)experts*capacity*(hidden/2);
+    hipStream_t s){size_t total=(size_t)experts*capacity*(hidden/4);
     pack_expert_bf16_kernel<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(
         out,in,counts,slots,experts,capacity,hidden);}
 extern "C" void dsv2_launch_convert_expert_bf16(uint16_t *out,const float *in,
