@@ -1260,9 +1260,12 @@ __global__ void grouped_expert_i8_32x64(float *output,const int8_t *input,
     const float *ws=weight_scales[expert];
     const int8_t *x=input+(size_t)expert*capacity*cols;
     __shared__ int8_t as[2][1024],bs[2][1024];
-    for(int z=tid;z<1024;z+=512){int r=z/16,k=z%16;
-        as[0][z]=tile_m+r<rows?w[(size_t)(tile_m+r)*cols+k]:0;
-        int n=z/16;bs[0][z]=tile_n+n<count?x[(size_t)(tile_n+n)*cols+k]:0;}
+    if(tid<256){int z=tid*4,r=z/16,k=z%16;
+        int32_t av=tile_m+r<rows?*reinterpret_cast<const int32_t *>(w+(size_t)(tile_m+r)*cols+k):0;
+        int n=z/16;
+        int32_t bv=tile_n+n<count?*reinterpret_cast<const int32_t *>(x+(size_t)(tile_n+n)*cols+k):0;
+        *reinterpret_cast<int32_t *>(as[0]+z)=av;
+        *reinterpret_cast<int32_t *>(bs[0]+z)=bv;}
     __syncthreads();
     for(int kb=0;kb<cols;kb+=16){int cur=(kb>>4)&1,nxt=cur^1;
         int ai=(mt*16+(lane&15))*16+kg;
@@ -1270,19 +1273,18 @@ __global__ void grouped_expert_i8_32x64(float *output,const int8_t *input,
         int32_t av=*reinterpret_cast<int32_t *>(as[cur]+ai);
         int32_t bv0=*reinterpret_cast<int32_t *>(bs[cur]+bi0);
         int32_t bv1=*reinterpret_cast<int32_t *>(bs[cur]+bi1);
-        int8_t na0=0,nb0=0,na1=0,nb1=0;
-        if(kb+16<cols){int k=tid&15,r=tid>>4,n=r;
-            if(tile_m+r<rows)na0=w[(size_t)(tile_m+r)*cols+kb+16+k];
-            if(tile_n+n<count)nb0=x[(size_t)(tile_n+n)*cols+kb+16+k];
-            r+=32;n+=32;
-            if(tile_m+r<rows)na1=w[(size_t)(tile_m+r)*cols+kb+16+k];
-            if(tile_n+n<count)nb1=x[(size_t)(tile_n+n)*cols+kb+16+k];}
+        int32_t na=0,nb=0;
+        if(kb+16<cols&&tid<256){int r=tid>>2,k=(tid&3)*4,n=r;
+            if(tile_m+r<rows)na=*reinterpret_cast<const int32_t *>(w+(size_t)(tile_m+r)*cols+kb+16+k);
+            if(tile_n+n<count)nb=*reinterpret_cast<const int32_t *>(x+(size_t)(tile_n+n)*cols+kb+16+k);}
         acc0=__builtin_amdgcn_mfma_i32_16x16x16i8(av,bv0,acc0,0,0,0);
         acc1=__builtin_amdgcn_mfma_i32_16x16x16i8(av,bv1,acc1,0,0,0);
-        if(kb+16<cols){as[nxt][tid]=na0;bs[nxt][tid]=nb0;
-            as[nxt][tid+512]=na1;bs[nxt][tid+512]=nb1;}
+        if(kb+16<cols&&tid<256){int z=tid*4;
+            *reinterpret_cast<int32_t *>(as[nxt]+z)=na;
+            *reinterpret_cast<int32_t *>(bs[nxt]+z)=nb;}
         __syncthreads();}
     int r=tile_m+mt*16+(lane>>4)*4,n0=tile_n+nt*16+(lane&15),n1=n0+32;
+    #pragma unroll
     for(int i=0;i<4;++i){if(n0<count&&r+i<rows){int route=slots[(size_t)expert*capacity+n0];
             float s=activation_scales[(size_t)expert*capacity+n0]*ws[r+i];
             output[(size_t)route*rows+r+i]=(float)acc0[i]*s;}
