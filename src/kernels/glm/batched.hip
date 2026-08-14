@@ -15,7 +15,7 @@
  *     grouped GEMM per expert (weights read once, vLLM-style), instead of B*K
  *     independent GEMVs.
  */
-#include "../kernels.h"
+#include "kernels.h"
 
 /* ======================================================================== *
  *  Tiled GEMM:  Y[m,n] = sum_k X[m*x_stride + k] * bf16f(W[n*K + k])

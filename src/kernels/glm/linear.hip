@@ -1,7 +1,7 @@
 /* GEMV-per-output-row kernels: one block computes one output scalar via a
  * blockDim-wide reduction over the contraction dimension. Mirrors matmul() in
  * src/run.c (y[d] = sum_i x[i] * W[d,i]) but parallel over (row, d_out). */
-#include "../kernels.h"
+#include "kernels.h"
 
 #define MM_THREADS 256
 
