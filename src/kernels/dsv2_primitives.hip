@@ -1160,25 +1160,28 @@ __global__ void grouped_expert_mfma_32x64(float *output,const uint16_t *input,
             output[(size_t)route*rows+r+i]=acc1[i];}}
 }
 
-__global__ void grouped_expert_gate_up_32x64(uint16_t *gate,float *up,
+__global__ void grouped_expert_gate_up_32x128(uint16_t *gate,float *up,
     const uint16_t *input,const uint16_t *const *gate_w,
     const uint16_t *const *up_w,const int *counts,int capacity,int rows,int cols){
     int expert=blockIdx.z,count=min(counts[expert],capacity);
-    if((int)blockIdx.y*64>=count)return;
+    if((int)blockIdx.y*128>=count)return;
     int tid=threadIdx.x,lane=tid&63,wave=tid>>6,mt=wave&1,nt=wave>>1;
-    int tile_m=blockIdx.x*64,tile_n=blockIdx.y*64,kg=(lane>>4)*4;
+    int tile_m=blockIdx.x*64,tile_n=blockIdx.y*128,kg=(lane>>4)*4;
     float4_acc ag0={0,0,0,0},au0={0,0,0,0},ag1={0,0,0,0},au1={0,0,0,0};
+    float4_acc bg0={0,0,0,0},bu0={0,0,0,0},bg1={0,0,0,0},bu1={0,0,0,0};
     const uint16_t *wg=gate_w[expert],*wu=up_w[expert];
     const uint16_t *x=input+(size_t)expert*capacity*cols;
-    __shared__ uint16_t gs[2][1024],us[2][1024],bs[2][1024];
+    __shared__ uint16_t gs[2][1024],us[2][1024],bs[2][2048];
     for(int z=tid;z<1024;z+=512){int r=z/16,k=z%16;
         if(tile_m+r<rows){gs[0][z]=wg[(size_t)(tile_m+r)*cols+k];
             us[0][z]=wu[(size_t)(tile_m+r)*cols+k];}else gs[0][z]=us[0][z]=0;
-        int n=z/16;bs[0][z]=tile_n+n<count?x[(size_t)(tile_n+n)*cols+k]:0;}
+        int n=z/16;bs[0][z]=tile_n+n<count?x[(size_t)(tile_n+n)*cols+k]:0;
+        n+=64;bs[0][z+1024]=tile_n+n<count?x[(size_t)(tile_n+n)*cols+k]:0;}
     __syncthreads();
     for(int kb=0;kb<cols;kb+=16){int cur=(kb>>4)&1,nxt=cur^1;
         int ai0=(mt*16+(lane&15))*16+kg;
         int ai1=((mt+2)*16+(lane&15))*16+kg,bi=(nt*16+(lane&15))*16+kg;
+        int bi2=bi+64*16;
         float2_reg gv0={__uint_as_float(*reinterpret_cast<uint32_t *>(gs[cur]+ai0)),
                         __uint_as_float(*reinterpret_cast<uint32_t *>(gs[cur]+ai0+2))};
         float2_reg uv0={__uint_as_float(*reinterpret_cast<uint32_t *>(us[cur]+ai0)),
@@ -1189,7 +1192,9 @@ __global__ void grouped_expert_gate_up_32x64(uint16_t *gate,float *up,
                         __uint_as_float(*reinterpret_cast<uint32_t *>(us[cur]+ai1+2))};
         float2_reg bv={__uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi)),
                        __uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi+2))};
-        uint16_t ng0=0,nu0=0,nb0=0,ng1=0,nu1=0,nb1=0;
+        float2_reg bv2={__uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi2)),
+                        __uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi2+2))};
+        uint16_t ng0=0,nu0=0,nb0=0,ng1=0,nu1=0,nb1=0,nb2=0,nb3=0;
         if(kb+16<cols){int k=tid&15,r=tid>>4,n=r;
             if(tile_m+r<rows){ng0=wg[(size_t)(tile_m+r)*cols+kb+16+k];
                 nu0=wu[(size_t)(tile_m+r)*cols+kb+16+k];}
@@ -1198,18 +1203,31 @@ __global__ void grouped_expert_gate_up_32x64(uint16_t *gate,float *up,
             if(tile_m+r<rows){ng1=wg[(size_t)(tile_m+r)*cols+kb+16+k];
                 nu1=wu[(size_t)(tile_m+r)*cols+kb+16+k];}
             if(tile_n+n<count)nb1=x[(size_t)(tile_n+n)*cols+kb+16+k];}
+        if(kb+16<cols){int k=tid&15,n=(tid>>4)+64;
+            if(tile_n+n<count)nb2=x[(size_t)(tile_n+n)*cols+kb+16+k];
+            n+=32;if(tile_n+n<count)nb3=x[(size_t)(tile_n+n)*cols+kb+16+k];}
         ag0=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(gv0,bv,ag0,0,0,0);
         au0=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(uv0,bv,au0,0,0,0);
         ag1=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(gv1,bv,ag1,0,0,0);
         au1=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(uv1,bv,au1,0,0,0);
+        bg0=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(gv0,bv2,bg0,0,0,0);
+        bu0=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(uv0,bv2,bu0,0,0,0);
+        bg1=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(gv1,bv2,bg1,0,0,0);
+        bu1=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(uv1,bv2,bu1,0,0,0);
         if(kb+16<cols){gs[nxt][tid]=ng0;us[nxt][tid]=nu0;bs[nxt][tid]=nb0;
-            gs[nxt][tid+512]=ng1;us[nxt][tid+512]=nu1;bs[nxt][tid+512]=nb1;}
+            gs[nxt][tid+512]=ng1;us[nxt][tid+512]=nu1;bs[nxt][tid+512]=nb1;
+            bs[nxt][tid+1024]=nb2;bs[nxt][tid+1536]=nb3;}
         __syncthreads();}
-    int r0=tile_m+mt*16+(lane>>4)*4,r1=r0+32,n=tile_n+nt*16+(lane&15);
+    int r0=tile_m+mt*16+(lane>>4)*4,r1=r0+32,n=tile_n+nt*16+(lane&15),n2=n+64;
+    #pragma unroll
     for(int i=0;i<4;++i){if(n<count&&r0+i<rows){size_t o=((size_t)expert*capacity+n)*rows+r0+i;
         float g=ag0[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*au0[i]);}
         if(n<count&&r1+i<rows){size_t o=((size_t)expert*capacity+n)*rows+r1+i;
-        float g=ag1[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*au1[i]);}}
+        float g=ag1[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*au1[i]);}
+        if(n2<count&&r0+i<rows){size_t o=((size_t)expert*capacity+n2)*rows+r0+i;
+        float g=bg0[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*bu0[i]);}
+        if(n2<count&&r1+i<rows){size_t o=((size_t)expert*capacity+n2)*rows+r1+i;
+        float g=bg1[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*bu1[i]);}}
 }
 
 __global__ void bucket_swiglu_kernel(float *gate,const float *up,
@@ -1623,7 +1641,7 @@ extern "C" void dsv2_launch_grouped_expert_gemm(float *out,const uint16_t *in,
 extern "C" void dsv2_launch_grouped_expert_gate_up(uint16_t *gate,float *up,
     const uint16_t *in,const uint16_t *const *gate_w,const uint16_t *const *up_w,
     const int *counts,int experts,int capacity,int rows,int cols,hipStream_t s){
-    grouped_expert_gate_up_32x64<<<dim3((rows+63)/64,(capacity+63)/64,experts),
+    grouped_expert_gate_up_32x128<<<dim3((rows+63)/64,(capacity+127)/128,experts),
         512,0,s>>>(gate,up,in,gate_w,up_w,counts,capacity,rows,cols);}
 extern "C" void dsv2_launch_bucket_swiglu(float *gate,const float *up,
     int experts,int capacity,int rows,hipStream_t s){
