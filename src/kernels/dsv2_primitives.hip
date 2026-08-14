@@ -984,7 +984,7 @@ __global__ void decode_attention_shared_heads(float *context,const float *qa,
         score=wave_sum(score);
         float a=0,b=0,nm=0,ns=0;
         if(lane==0){score*=scale;nm=fmaxf(rmax,score);
-            a=expf(rmax-nm);b=expf(score-nm);ns=rsum*a+b;}
+            a=__expf(rmax-nm);b=__expf(score-nm);ns=rsum*a+b;}
         a=__shfl(a,0,64);b=__shfl(b,0,64);
         nm=__shfl(nm,0,64);ns=__shfl(ns,0,64);
         #pragma unroll
@@ -1065,7 +1065,7 @@ __global__ void prefill_unabsorbed_attention_q4(float *output,const float *query
             for(int d=lane;d<nope+rope;d+=64)score+=q[d]*sk[cur][d];
         score=wave_sum(score);float a=0,b=0,nm=0,ns=0;
         if(lane==0){if(qpos<sequence_length&&k<=qpos){score*=scale;
-                nm=fmaxf(rmax,score);a=expf(rmax-nm);b=expf(score-nm);ns=rsum*a+b;}
+                nm=fmaxf(rmax,score);a=__expf(rmax-nm);b=__expf(score-nm);ns=rsum*a+b;}
             else{nm=rmax;ns=rsum;a=1.0f;b=0.0f;}}
         a=__shfl(a,0,64);b=__shfl(b,0,64);
         nm=__shfl(nm,0,64);ns=__shfl(ns,0,64);
