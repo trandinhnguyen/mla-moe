@@ -984,18 +984,18 @@ __global__ void decode_attention_shared_heads(float *context,const float *qa,
         score=wave_sum(score);
         float a=0,b=0,nm=0,ns=0;
         if(lane==0){score*=scale;nm=fmaxf(rmax,score);
-            a=__expf(rmax-nm);b=__expf(score-nm);ns=rsum*a+b;}
+            a=__expf(rmax-nm);b=__expf(score-nm);ns=rsum*a+b;
+            rmax=nm;rsum=ns;}
         a=__shfl(a,0,64);b=__shfl(b,0,64);
-        nm=__shfl(nm,0,64);ns=__shfl(ns,0,64);
         #pragma unroll
         for(int j=0;j<8;++j)acc[j]=acc[j]*a+b*kvs[cur][lane+j*64];
-        rmax=nm;rsum=ns;
         if(key<pos&&threadIdx.x<stride)kvs[nxt][threadIdx.x]=next_value;
         __syncthreads();
     }
     float *out=context+((size_t)request*heads+h)*latent;
+    float denom=__shfl(rsum,0,64);
     #pragma unroll
-    for(int j=0;j<8;++j)out[lane+j*64]=acc[j]/rsum;
+    for(int j=0;j<8;++j)out[lane+j*64]=acc[j]/denom;
 }
 
 __global__ void batched_latent_value_kernel(
@@ -1065,18 +1065,18 @@ __global__ void prefill_unabsorbed_attention_q4(float *output,const float *query
             for(int d=lane;d<nope+rope;d+=64)score+=q[d]*sk[cur][d];
         score=wave_sum(score);float a=0,b=0,nm=0,ns=0;
         if(lane==0){if(qpos<sequence_length&&k<=qpos){score*=scale;
-                nm=fmaxf(rmax,score);a=__expf(rmax-nm);b=__expf(score-nm);ns=rsum*a+b;}
+                nm=fmaxf(rmax,score);a=__expf(rmax-nm);b=__expf(score-nm);ns=rsum*a+b;
+                rmax=nm;rsum=ns;}
             else{nm=rmax;ns=rsum;a=1.0f;b=0.0f;}}
         a=__shfl(a,0,64);b=__shfl(b,0,64);
-        nm=__shfl(nm,0,64);ns=__shfl(ns,0,64);
         acc0=acc0*a+b*sv[cur][lane];acc1=acc1*a+b*sv[cur][lane+64];
-        rmax=nm;rsum=ns;
         if(k<last){if(threadIdx.x<nope)sk[nxt][threadIdx.x]=next_k;
             if(threadIdx.x<rope)sk[nxt][nope+threadIdx.x]=next_r;
             if(threadIdx.x<vdim)sv[nxt][threadIdx.x]=next_v;}
         __syncthreads();}
     if(qpos<sequence_length){float *out=output+((size_t)row*heads+h)*vdim;
-        out[lane]=acc0/rsum;out[lane+64]=acc1/rsum;}
+        float denom=__shfl(rsum,0,64);
+        out[lane]=acc0/denom;out[lane+64]=acc1/denom;}
 }
 
 __global__ void batched_router_topk_kernel(const float *logits, int batch,
