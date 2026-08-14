@@ -124,8 +124,8 @@ constexpr int ROUTE_CAPACITY = 1536;
 /* The scoring tier is semantic rather than token-exact.  A recent-context
  * window keeps the continuation topic/style while turning five ragged prompt
  * groups into one highly efficient B=512 prefill GEMM. */
-constexpr int FUZZY_CONTEXT_TOKENS = 48;
-constexpr int FUZZY_PREFIX_TOKENS = 0;
+constexpr int FUZZY_CONTEXT_TOKENS = 45;
+constexpr int FUZZY_PREFIX_TOKENS = 3;
 
 struct MaxPair {
     float value;
