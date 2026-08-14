@@ -1212,6 +1212,62 @@ __global__ void grouped_expert_mfma_32x64(float *output,const uint16_t *input,
             output[(size_t)route*rows+r+i]=acc1[i];}}
 }
 
+__global__ void grouped_expert_mfma_64x128(float *output,const uint16_t *input,
+    const uint16_t *const *weights,const int *counts,const int *slots,
+    int capacity,int rows,int cols){
+    int expert=blockIdx.z,count=min(counts[expert],capacity);
+    if((int)blockIdx.y*128>=count)return;
+    int tid=threadIdx.x,lane=tid&63,wave=tid>>6,mt=wave&1,nt=wave>>1;
+    int tile_m=blockIdx.x*64,tile_n=blockIdx.y*128,kg=(lane>>4)*4;
+    float4_acc a0={0,0,0,0},a1={0,0,0,0},b0={0,0,0,0},b1={0,0,0,0};
+    const uint16_t *w=weights[expert];
+    const uint16_t *x=input+(size_t)expert*capacity*cols;
+    __shared__ uint16_t as[2][1024],bs[2][2048];
+    for(int z=tid;z<1024;z+=512){int r=z/16,k=z%16;
+        as[0][z]=tile_m+r<rows?w[(size_t)(tile_m+r)*cols+k]:0;
+        int n=z/16;bs[0][z]=tile_n+n<count?x[(size_t)(tile_n+n)*cols+k]:0;
+        n+=64;bs[0][z+1024]=tile_n+n<count?x[(size_t)(tile_n+n)*cols+k]:0;}
+    __syncthreads();
+    for(int kb=0;kb<cols;kb+=16){int cur=(kb>>4)&1,nxt=cur^1;
+        int ai0=(mt*16+(lane&15))*16+kg,ai1=ai0+32*16;
+        int bi=(nt*16+(lane&15))*16+kg,bi2=bi+64*16;
+        float2_reg av0={__uint_as_float(*reinterpret_cast<uint32_t *>(as[cur]+ai0)),
+                        __uint_as_float(*reinterpret_cast<uint32_t *>(as[cur]+ai0+2))};
+        float2_reg av1={__uint_as_float(*reinterpret_cast<uint32_t *>(as[cur]+ai1)),
+                        __uint_as_float(*reinterpret_cast<uint32_t *>(as[cur]+ai1+2))};
+        float2_reg bv0={__uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi)),
+                        __uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi+2))};
+        float2_reg bv1={__uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi2)),
+                        __uint_as_float(*reinterpret_cast<uint32_t *>(bs[cur]+bi2+2))};
+        uint16_t na0=0,na1=0,nb0=0,nb1=0,nb2=0,nb3=0;
+        if(kb+16<cols){int k=tid&15,r=tid>>4,n=r;
+            if(tile_m+r<rows)na0=w[(size_t)(tile_m+r)*cols+kb+16+k];
+            if(tile_n+n<count)nb0=x[(size_t)(tile_n+n)*cols+kb+16+k];
+            r+=32;n+=32;
+            if(tile_m+r<rows)na1=w[(size_t)(tile_m+r)*cols+kb+16+k];
+            if(tile_n+n<count)nb1=x[(size_t)(tile_n+n)*cols+kb+16+k];
+            n=(tid>>4)+64;if(tile_n+n<count)nb2=x[(size_t)(tile_n+n)*cols+kb+16+k];
+            n+=32;if(tile_n+n<count)nb3=x[(size_t)(tile_n+n)*cols+kb+16+k];}
+        a0=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av0,bv0,a0,0,0,0);
+        a1=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av1,bv0,a1,0,0,0);
+        b0=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av0,bv1,b0,0,0,0);
+        b1=__builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av1,bv1,b1,0,0,0);
+        if(kb+16<cols){as[nxt][tid]=na0;bs[nxt][tid]=nb0;
+            as[nxt][tid+512]=na1;bs[nxt][tid+512]=nb1;
+            bs[nxt][tid+1024]=nb2;bs[nxt][tid+1536]=nb3;}
+        __syncthreads();}
+    int r0=tile_m+mt*16+(lane>>4)*4,r1=r0+32;
+    int n0=tile_n+nt*16+(lane&15),n1=n0+64;
+    int route0=n0<count?slots[(size_t)expert*capacity+n0]:0;
+    int route1=n1<count?slots[(size_t)expert*capacity+n1]:0;
+    #pragma unroll
+    for(int i=0;i<4;++i){
+        if(n0<count&&r0+i<rows)output[(size_t)route0*rows+r0+i]=a0[i];
+        if(n0<count&&r1+i<rows)output[(size_t)route0*rows+r1+i]=a1[i];
+        if(n1<count&&r0+i<rows)output[(size_t)route1*rows+r0+i]=b0[i];
+        if(n1<count&&r1+i<rows)output[(size_t)route1*rows+r1+i]=b1[i];}
+}
+
 __global__ void grouped_expert_gate_up_32x128(uint16_t *gate,float *up,
     const uint16_t *input,const uint16_t *const *gate_w,
     const uint16_t *const *up_w,const int *counts,int capacity,int rows,int cols,
@@ -1701,7 +1757,7 @@ extern "C" void dsv2_launch_convert_expert_bf16(uint16_t *out,const float *in,
 extern "C" void dsv2_launch_grouped_expert_gemm(float *out,const uint16_t *in,
     const uint16_t *const *weights,const int *counts,const int *slots,int experts,
     int capacity,int rows,int cols,int input_mode,hipStream_t s){
-    grouped_expert_mfma_32x64<<<dim3((rows+63)/64,(capacity+63)/64,experts),512,0,s>>>(
+    grouped_expert_mfma_64x128<<<dim3((rows+63)/64,(capacity+127)/128,experts),512,0,s>>>(
         out,in,weights,counts,slots,capacity,rows,cols);}
 extern "C" void dsv2_launch_grouped_expert_gate_up(uint16_t *gate,float *up,
     const uint16_t *in,const uint16_t *const *gate_w,const uint16_t *const *up_w,
