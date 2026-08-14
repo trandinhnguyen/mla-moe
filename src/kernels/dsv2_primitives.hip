@@ -1214,14 +1214,16 @@ __global__ void grouped_expert_mfma_32x64(float *output,const uint16_t *input,
 
 __global__ void grouped_expert_gate_up_32x128(uint16_t *gate,float *up,
     const uint16_t *input,const uint16_t *const *gate_w,
-    const uint16_t *const *up_w,const int *counts,int capacity,int rows,int cols){
-    int expert=blockIdx.z,count=min(counts[expert],capacity);
+    const uint16_t *const *up_w,const int *counts,int capacity,int rows,int cols,
+    int single_count){
+    int expert=blockIdx.z,count=single_count>=0?single_count:min(counts[expert],capacity);
     if((int)blockIdx.y*128>=count)return;
     int tid=threadIdx.x,lane=tid&63,wave=tid>>6,mt=wave&1,nt=wave>>1;
     int tile_m=blockIdx.x*64,tile_n=blockIdx.y*128,kg=(lane>>4)*4;
     float4_acc ag0={0,0,0,0},au0={0,0,0,0},ag1={0,0,0,0},au1={0,0,0,0};
     float4_acc bg0={0,0,0,0},bu0={0,0,0,0},bg1={0,0,0,0},bu1={0,0,0,0};
-    const uint16_t *wg=gate_w[expert],*wu=up_w[expert];
+    const uint16_t *wg=single_count>=0?reinterpret_cast<const uint16_t *>(gate_w):gate_w[expert];
+    const uint16_t *wu=single_count>=0?reinterpret_cast<const uint16_t *>(up_w):up_w[expert];
     const uint16_t *x=input+(size_t)expert*capacity*cols;
     __shared__ uint16_t gs[2][1024],us[2][1024],bs[2][2048];
     for(int z=tid;z<1024;z+=512){int r=z/16,k=z%16;
@@ -1705,7 +1707,21 @@ extern "C" void dsv2_launch_grouped_expert_gate_up(uint16_t *gate,float *up,
     const uint16_t *in,const uint16_t *const *gate_w,const uint16_t *const *up_w,
     const int *counts,int experts,int capacity,int rows,int cols,hipStream_t s){
     grouped_expert_gate_up_32x128<<<dim3((rows+63)/64,(capacity+127)/128,experts),
-        512,0,s>>>(gate,up,in,gate_w,up_w,counts,capacity,rows,cols);}
+        512,0,s>>>(gate,up,in,gate_w,up_w,counts,capacity,rows,cols,-1);}
+extern "C" void dsv2_launch_single_gate_up(uint16_t *gate,const uint16_t *in,
+    const uint16_t *gate_w,const uint16_t *up_w,int batch,int rows,int cols,
+    hipStream_t s){
+    grouped_expert_gate_up_32x128<<<dim3((rows+63)/64,(batch+127)/128,1),512,0,s>>>(
+        gate,nullptr,in?in:mfma_input,reinterpret_cast<const uint16_t *const *>(gate_w),
+        reinterpret_cast<const uint16_t *const *>(up_w),nullptr,batch,rows,cols,batch);}
+extern "C" void dsv2_launch_bf16_input_matvec(float *out,const uint16_t *in,
+    const uint16_t *w,int batch,int rows,int cols,hipStream_t s){
+    if(batch>=96)
+        mfma_bf16_gemm_64x128<<<dim3((rows+63)/64,(batch+127)/128),512,0,s>>>(
+            out,in,w,batch,rows,cols);
+    else
+        mfma_bf16_gemm_32x64<<<dim3((rows+63)/64,(batch+63)/64),512,0,s>>>(
+            out,in,w,batch,rows,cols);}
 extern "C" void dsv2_launch_bucket_swiglu(float *gate,const float *up,
     int experts,int capacity,int rows,hipStream_t s){
     int total=experts*capacity*rows;

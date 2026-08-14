@@ -87,6 +87,10 @@ void dsv2_launch_grouped_expert_gemm(float *,const uint16_t *,
 void dsv2_launch_grouped_expert_gate_up(uint16_t *,float *,const uint16_t *,
     const uint16_t *const *,const uint16_t *const *,const int *,int,int,int,int,
     hipStream_t);
+void dsv2_launch_single_gate_up(uint16_t *,const uint16_t *,const uint16_t *,
+    const uint16_t *,int,int,int,hipStream_t);
+void dsv2_launch_bf16_input_matvec(float *,const uint16_t *,const uint16_t *,
+    int,int,int,hipStream_t);
 void dsv2_launch_bucket_swiglu(float *,const float *,int,int,int,hipStream_t);
 void dsv2_launch_reduce_bucket_experts(float *,const float *,const int *,
     const int *,const float *,int,int,int,int,hipStream_t);
@@ -579,10 +583,12 @@ void gpu_swiglu_batch(float *output, const float *input,
     for(int start=0;start<batch;start+=8192){
         int n=std::min(8192,batch-start);
         const float *x=input+(size_t)start*hidden;
-        dsv2_launch_batched_swiglu_mfma(gpu_state.phb,x,gate,up,n,
-                                        intermediate,hidden,0);
-        dsv2_launch_batched_matvec(output+(size_t)start*hidden,gpu_state.phb,down,
-                                   n,hidden,intermediate,0);
+        dsv2_prepare_batched_bf16(x,n,hidden,0);
+        auto *fused=reinterpret_cast<uint16_t *>(gpu_state.phb);
+        dsv2_launch_single_gate_up(fused,nullptr,gate,up,n,intermediate,hidden,0);
+        /* single_gate_up consumes the globally prepared MFMA input. */
+        dsv2_launch_bf16_input_matvec(output+(size_t)start*hidden,fused,down,
+                                      n,hidden,intermediate,0);
     }
 }
 
@@ -595,9 +601,11 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
                                c.n_routed_experts,H,0);
     dsv2_launch_batched_router_topk(gpu_state.prouter,batch,c.n_routed_experts,K,
                                     gpu_state.ptopk_index,gpu_state.ptopk_weight,0);
-    dsv2_launch_prepared_swiglu(gpu_state.phb,w.shared_gate,w.shared_up,batch,
-                                SHARED,H,0);
-    dsv2_launch_batched_matvec(output,gpu_state.phb,w.shared_down,batch,H,SHARED,0);
+    auto *shared_bf16=reinterpret_cast<uint16_t *>(gpu_state.phb);
+    dsv2_launch_single_gate_up(shared_bf16,nullptr,w.shared_gate,w.shared_up,
+                              batch,SHARED,H,0);
+    dsv2_launch_bf16_input_matvec(output,shared_bf16,w.shared_down,
+                                  batch,H,SHARED,0);
     int capacity=std::min(ROUTE_CAPACITY,std::max(128,
         (batch*K+c.n_routed_experts-1)/c.n_routed_experts*5));
     dsv2_launch_bucket_routes(gpu_state.ptopk_index,gpu_state.ptopk_weight,batch,K,
