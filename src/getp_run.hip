@@ -2,10 +2,18 @@
  * THIS IS THE FILE YOU MODIFY (a HIP/C++ translation unit).
  *
  * Your task: maximize end-to-end throughput (tok/s) of inference() over the
- * request batch, WITHOUT breaking correctness (`make eval` must still pass its
- * thresholds). The intended path is to port the compute to the GPU: start from
- * this correct CPU reference, then replace the forward_* calls with your own
- * kernels — allocate/upload in warm_up(), free in finish().
+ * request batch, WITHOUT breaking correctness (`make getp-eval` must still pass
+ * its thresholds — it scores the token ids YOUR inference() writes). The intended
+ * path is to port the compute to the GPU: start from this correct CPU reference,
+ * then replace the forward_* calls with your own kernels — allocate/upload in
+ * warm_up(), free in finish().
+ *
+ * inference() is handed the WHOLE batch and owns its scheduling: the loop below
+ * runs one request at a time only because that is the simplest correct start.
+ * Batching, continuous batching, and multiple requests in flight are all fair
+ * game — the grader scores the output ids, not how you produced them. (The frozen
+ * forward_* kernels share one RunState KV cache, so batching means bringing your
+ * own kernels and your own cache.)
  *
  * Write __global__ kernels here (note the trailing double underscores) and launch
  * them with <<<>>> directly; expose inference()/warm_up()/finish() as usual — they

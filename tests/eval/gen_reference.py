@@ -37,6 +37,9 @@ import load_oracle  # noqa: E402  (model_dir single-sourced from the oracle mani
 import transformers  # noqa: E402
 
 
+_RUN_C_MAX_IDS = 4096      # src/run.c read_tokens_i32 reads at most this many
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("model", nargs="?", default="dsv2lite", choices=["dsv2lite", "glm47"])
@@ -44,8 +47,20 @@ def parse_args():
                    help="requests file (default <model>/requests.txt)")
     p.add_argument("-o", "--out", default=None, help="output dir (default <model>/)")
     p.add_argument("--max-new", type=int, default=64, help="tokens to greedy-generate per prompt")
-    p.add_argument("--max-tokens", type=int, default=4096, help="C-engine buffer cap (full seq)")
-    return p.parse_args()
+    p.add_argument("--max-tokens", type=int, default=_RUN_C_MAX_IDS,
+                   help="C-engine buffer cap (full seq)")
+    args = p.parse_args()
+    # src/run.c reads at most _RUN_C_MAX_IDS ids. tests/eval/eval.py refuses a
+    # dataset above min(that limit, the model's KV cache), so this bound is the
+    # looser of the two -- a set inside it can still be refused by a model with a
+    # smaller max_position_embeddings.
+    if not 2 <= args.max_tokens <= _RUN_C_MAX_IDS:
+        p.error(f"--max-tokens must be in [2, {_RUN_C_MAX_IDS}] "
+                f"({_RUN_C_MAX_IDS} is the read limit in src/run.c; "
+                f"below 2 no prompt fits)")
+    if args.max_new < 1:
+        p.error("--max-new must be >= 1")
+    return args
 
 
 def read_requests(path):
@@ -102,6 +117,16 @@ def main():
         cids = out[0, plen:].tolist()
         full = torch.cat([pids, torch.tensor([cids])], dim=1)
         nll, ntok = hf_full_nll(model, full)
+        # The dataset is the frozen artefact of the exam: a non-finite or
+        # unusable nll here would be baked in, and every later `make eval` would
+        # report it as a misconfiguration of the grader's machine. Fail now.
+        # The 709.0 must equal _EXP_MAX in tests/eval/eval.py: past that mean,
+        # math.exp overflows and the reader rejects the record as a dataset
+        # defect -- which is exactly what this test exists to prevent.
+        if (not (nll == nll and abs(nll) != float("inf")) or ntok < 1 or nll < 0
+                or nll > 709.0 * ntok):
+            sys.exit(f"prompt {i}: unusable teacher-forced nll {nll!r} over {ntok} "
+                     f"tokens -- refusing to freeze it into reference.json")
         records.append({"prompt_len": plen, "completion_len": len(cids),
                         "hf_nll": nll, "hf_ntok": ntok})
         prompt_lines.append(" ".join(map(str, pids[0].tolist())))
