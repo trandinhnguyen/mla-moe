@@ -141,6 +141,14 @@ static float  **ds_qa=NULL, **ds_qb=NULL, **ds_kva=NULL, **ds_op=NULL;
  * bf16 always (tiny N=64 GEMM, ~0 throughput, chaotic top-K routing). FFN opt-out
  * via MLA_FFN_W8A8=0. */
 static int   g_ffn_w8a8 = 1, g_lmhead_w8a8 = 0;
+/* run29: W4A8 MoE experts -- int4 packed weight (per-row scale) x int8 activation.
+ * Halves the MoE-GEMM weight L2 bytes (the L2-BW bound at B=1024). Opt-in via
+ * MLA_MOE_W4A8=1 (accuracy risk: int4 is coarse; measured before spreading to dense).
+ * When on, the MoE expert tables (d_epq_gate/...) hold packed int4 instead of int8. */
+static int   g_moe_w4a8 = 0;
+/* run31: TBK=64 / 128-bit-load MoE GEMM (bit-identical; 4x fewer syncs). Opt-in
+ * MLA_MOE_TBK64=1 to A/B the load-width on the L2-BW-bound MoE GEMM. */
+static int   g_moe_tbk64 = 0;
 static int8_t **dq_sg=NULL, **dq_su=NULL, **dq_sd=NULL;   /* shared-expert gate/up/down */
 static float  **ds_sg=NULL, **ds_su=NULL, **ds_sd=NULL;
 static int8_t **dq_dg=NULL, **dq_du=NULL, **dq_dd=NULL;   /* dense-layer FFN (l<first_k_dense) */
@@ -441,6 +449,16 @@ static void quant_one_expert(bf16_t *src, int rows, int cols, int8_t **out_q, fl
     HIP_CHECK(hipFree(src));
 }
 
+/* run29: quantize one bf16 expert [rows][cols] into PACKED int4 [rows][cols/2] +
+ * per-row fp32 scale, then free the bf16 source (W4A8 MoE path). cols even. */
+static void quant_one_expert_i4(bf16_t *src, int rows, int cols, int8_t **out_q, float **out_s)
+{
+    HIP_CHECK(hipMalloc((void **)out_q, (size_t)rows * (cols / 2) * sizeof(int8_t)));
+    HIP_CHECK(hipMalloc((void **)out_s, (size_t)rows * sizeof(float)));
+    quantize_rows_i4_kernel<<<rows, 256>>>(src, *out_q, *out_s, rows, cols);
+    HIP_CHECK(hipFree(src));
+}
+
 /* run20: quantize a bf16 weight [rows][cols] to int8 + per-row scale but KEEP the
  * bf16 (the W8A8 path is opt-out via MLA_DENSE_W8A8=0, and lm_head still needs bf16). */
 static void quant_keep(const bf16_t *src, int rows, int cols, int8_t **out_q, float **out_s)
@@ -543,9 +561,11 @@ static void build_moe_int8_tables(Transformer *t)
         hs_d[l] = (float **)malloc(NR * sizeof(float *));
         for (int e = 0; e < NR; e++)
         {
-            quant_one_expert(d_w.expert_gate[l][e], I, H, &hq_g[l][e], &hs_g[l][e]);
-            quant_one_expert(d_w.expert_up[l][e],   I, H, &hq_u[l][e], &hs_u[l][e]);
-            quant_one_expert(d_w.expert_down[l][e], H, I, &hq_d[l][e], &hs_d[l][e]);
+            void (*qexp)(bf16_t *, int, int, int8_t **, float **) =
+                g_moe_w4a8 ? quant_one_expert_i4 : quant_one_expert;
+            qexp(d_w.expert_gate[l][e], I, H, &hq_g[l][e], &hs_g[l][e]);
+            qexp(d_w.expert_up[l][e],   I, H, &hq_u[l][e], &hs_u[l][e]);
+            qexp(d_w.expert_down[l][e], H, I, &hq_d[l][e], &hs_d[l][e]);
             d_w.expert_gate[l][e] = d_w.expert_up[l][e] = d_w.expert_down[l][e] = NULL;
         }
         /* Upload per-expert pointer arrays to device tables (kernel indexes by e). */
@@ -611,11 +631,18 @@ static void free_wuk_transpose(Transformer *t)
 
 /* ==== LIFECYCLE: warm_up (upload + allocate) / finish (free) =============== */
 
+/* run30: one tiny forward (prefill 4 tokens + 2 decode steps) at the end of
+ * warm_up to JIT the hot kernels, touch their scratch, and ramp GPU clocks before
+ * the timed inference. Defined after the forward-pass helpers it calls. */
+static void glm_warmup_forward(Transformer *t);
+
 void glm_warm_up(Transformer *t)
 {
     device_malloc_model_weights(t);
     build_moe_device_tables(t);
-    build_moe_int8_tables(t);   /* run4: quantize experts to int8, free bf16 */
+    if (getenv("MLA_MOE_W4A8") && atoi(getenv("MLA_MOE_W4A8")) == 1) g_moe_w4a8 = 1;
+    if (getenv("MLA_MOE_TBK64") && atoi(getenv("MLA_MOE_TBK64")) == 1) g_moe_tbk64 = 1;
+    build_moe_int8_tables(t);   /* run4: quantize experts to int8 (or int4 if g_moe_w4a8), free bf16 */
     build_wuk_transpose(t);
     if (getenv("MLA_DENSE_W8A8") && atoi(getenv("MLA_DENSE_W8A8")) == 0) g_dense_w8a8 = 0;
     if (getenv("MLA_DENSE_T128") && atoi(getenv("MLA_DENSE_T128")) == 0) g_dense_t128 = 0;
@@ -703,6 +730,8 @@ void glm_warm_up(Transformer *t)
 
     HIP_CHECK(hipMalloc((void **)&d_logits, (size_t)c->vocab_size * sizeof(float)));
     HIP_CHECK(hipMalloc((void **)&d_argmax, sizeof(int)));
+
+    glm_warmup_forward(t);   /* run30: prefill 4 + 2 decode steps to warm kernels */
 }
 
 void glm_finish(Transformer *t)
@@ -902,16 +931,57 @@ static void ffn_batched(const Config *c, int l, const float *xn, float *out,
      * dequant-VALU bottleneck of the weight-only-int8 GEMM. MLA_MOE_W8A8=0 reverts
      * to the bf16-MFMA weight-only path for A/B. Shared expert stays bf16. */
     static const int w8a8 = !(getenv("MLA_MOE_W8A8") && atoi(getenv("MLA_MOE_W8A8")) == 0);
+    /* run24: 128x128-tile grouped MoE GEMM halves the L2 activation re-reads of the
+     * 64x64 kernel (profile @ B=1024: moe_grouped_mfma_i8i8 L2-BW-bound, 133% peak).
+     * The tile is bit-identical; the coarse grid still floods the CUs (NR=64 experts
+     * x ceil(N/128) col-tiles). MLA_MOE_T128=0 reverts to the 64x64 kernel for A/B. */
+    static const int t128 = !(getenv("MLA_MOE_T128") && atoi(getenv("MLA_MOE_T128")) == 0);
     dim3 gGU(ceil_div(I, MM_TILE), ceil_div(n_rows, MM_TILE), NR);
     dim3 gD(ceil_div(H, MM_TILE), ceil_div(n_rows, MM_TILE), NR);
     if (w8a8)
     {
         quant_act_rows_i8_kernel<<<n_rows, 256>>>(xn, b_xn_i8, b_xn_scale, n_rows, H, H);
-        moe_grouped_mfma_i8i8_kernel<<<gGU, 256>>>(b_hbk, b_xn_i8, b_xn_scale, d_epq_gate[l], d_eps_gate[l], b_eoff, b_sorted_slot, I, H, H, 1);
-        moe_grouped_mfma_i8i8_kernel<<<gGU, 256>>>(b_hb2k, b_xn_i8, b_xn_scale, d_epq_up[l], d_eps_up[l], b_eoff, b_sorted_slot, I, H, H, 1);
-        silu_mul_kernel<<<ceil_div(T * I, 256), 256>>>(b_hbk, b_hb2k, T * I);
-        quant_act_rows_i8_kernel<<<T, 256>>>(b_hbk, b_hbk_i8, b_hbk_scale, T, I, I);
-        moe_grouped_mfma_i8i8_kernel<<<gD, 256>>>(b_downk, b_hbk_i8, b_hbk_scale, d_epq_down[l], d_eps_down[l], b_eoff, b_sorted_slot, H, I, I, 0);
+        if (g_moe_w4a8)
+        {
+            /* run29: int4 packed weight -> must use the W4A8 kernel (128-tile). */
+            dim3 gGU2(ceil_div(I, 128), ceil_div(n_rows, 128), NR);
+            dim3 gD2(ceil_div(H, 128), ceil_div(n_rows, 128), NR);
+            moe_grouped_mfma_w4a8_128_kernel<<<gGU2, 256>>>(b_hbk, b_xn_i8, b_xn_scale, d_epq_gate[l], d_eps_gate[l], b_eoff, b_sorted_slot, I, H, H, 1);
+            moe_grouped_mfma_w4a8_128_kernel<<<gGU2, 256>>>(b_hb2k, b_xn_i8, b_xn_scale, d_epq_up[l], d_eps_up[l], b_eoff, b_sorted_slot, I, H, H, 1);
+            silu_mul_kernel<<<ceil_div(T * I, 256), 256>>>(b_hbk, b_hb2k, T * I);
+            quant_act_rows_i8_kernel<<<T, 256>>>(b_hbk, b_hbk_i8, b_hbk_scale, T, I, I);
+            moe_grouped_mfma_w4a8_128_kernel<<<gD2, 256>>>(b_downk, b_hbk_i8, b_hbk_scale, d_epq_down[l], d_eps_down[l], b_eoff, b_sorted_slot, H, I, I, 0);
+        }
+        else if (t128)
+        {
+            dim3 gGU2(ceil_div(I, 128), ceil_div(n_rows, 128), NR);
+            dim3 gD2(ceil_div(H, 128), ceil_div(n_rows, 128), NR);
+            /* run31: g_moe_tbk64 picks the TBK=64/128-bit-load kernel (bit-identical). */
+            if (g_moe_tbk64)
+            {
+                moe_grouped_mfma_i8i8_t64_kernel<<<gGU2, 256>>>(b_hbk, b_xn_i8, b_xn_scale, d_epq_gate[l], d_eps_gate[l], b_eoff, b_sorted_slot, I, H, H, 1);
+                moe_grouped_mfma_i8i8_t64_kernel<<<gGU2, 256>>>(b_hb2k, b_xn_i8, b_xn_scale, d_epq_up[l], d_eps_up[l], b_eoff, b_sorted_slot, I, H, H, 1);
+                silu_mul_kernel<<<ceil_div(T * I, 256), 256>>>(b_hbk, b_hb2k, T * I);
+                quant_act_rows_i8_kernel<<<T, 256>>>(b_hbk, b_hbk_i8, b_hbk_scale, T, I, I);
+                moe_grouped_mfma_i8i8_t64_kernel<<<gD2, 256>>>(b_downk, b_hbk_i8, b_hbk_scale, d_epq_down[l], d_eps_down[l], b_eoff, b_sorted_slot, H, I, I, 0);
+            }
+            else
+            {
+                moe_grouped_mfma_i8i8_128_kernel<<<gGU2, 256>>>(b_hbk, b_xn_i8, b_xn_scale, d_epq_gate[l], d_eps_gate[l], b_eoff, b_sorted_slot, I, H, H, 1);
+                moe_grouped_mfma_i8i8_128_kernel<<<gGU2, 256>>>(b_hb2k, b_xn_i8, b_xn_scale, d_epq_up[l], d_eps_up[l], b_eoff, b_sorted_slot, I, H, H, 1);
+                silu_mul_kernel<<<ceil_div(T * I, 256), 256>>>(b_hbk, b_hb2k, T * I);
+                quant_act_rows_i8_kernel<<<T, 256>>>(b_hbk, b_hbk_i8, b_hbk_scale, T, I, I);
+                moe_grouped_mfma_i8i8_128_kernel<<<gD2, 256>>>(b_downk, b_hbk_i8, b_hbk_scale, d_epq_down[l], d_eps_down[l], b_eoff, b_sorted_slot, H, I, I, 0);
+            }
+        }
+        else
+        {
+            moe_grouped_mfma_i8i8_kernel<<<gGU, 256>>>(b_hbk, b_xn_i8, b_xn_scale, d_epq_gate[l], d_eps_gate[l], b_eoff, b_sorted_slot, I, H, H, 1);
+            moe_grouped_mfma_i8i8_kernel<<<gGU, 256>>>(b_hb2k, b_xn_i8, b_xn_scale, d_epq_up[l], d_eps_up[l], b_eoff, b_sorted_slot, I, H, H, 1);
+            silu_mul_kernel<<<ceil_div(T * I, 256), 256>>>(b_hbk, b_hb2k, T * I);
+            quant_act_rows_i8_kernel<<<T, 256>>>(b_hbk, b_hbk_i8, b_hbk_scale, T, I, I);
+            moe_grouped_mfma_i8i8_kernel<<<gD, 256>>>(b_downk, b_hbk_i8, b_hbk_scale, d_epq_down[l], d_eps_down[l], b_eoff, b_sorted_slot, H, I, I, 0);
+        }
     }
     else
     {
@@ -1229,11 +1299,22 @@ static void device_forward_absorbed_batched(Transformer *t, int B, int kv_max)
              * once per slot per head group -> relieves the L2-read bound at B=1024.
              * A/B via MLA_FDHB=0 (revert to per-(head,slot) attn_flash_decode). */
             static const int fdhb = !(getenv("MLA_FDHB") && atoi(getenv("MLA_FDHB")) == 0);
+            /* run27: MFMA-score head-batched decode (offloads the KVD dot to the
+             * matrix cores). NEGATIVE at B=1024 (-2.4%: kernel is latency/occupancy-
+             * bound, not compute-bound -- VALU only 43.6%; tk=32 -> 2 of 4 warps idle
+             * during the MFMA, M=16 pads HPB=10). Kept opt-in (MLA_FDMFMA=1) for
+             * reference; the scalar-score hb kernel stays default. See report/run27. */
+            static const int fdmfma = (getenv("MLA_FDMFMA") && atoi(getenv("MLA_FDMFMA")) == 1);
             if (fdhb && NH == 20 && KVL == 512 && KVD == 576) {
                 dim3 gFlash(B, 2);   /* FD_HG = 2 head groups */
-                attn_flash_decode_hb_kernel<<<gFlash, 256>>>(b_clat, b_qabs, b_q, kv_base,
-                                                             kv_scale_base, b_pos, NH, QHD, QKN, QKR,
-                                                             KVL, KVD, slot_stride, scale);
+                if (fdmfma)
+                    attn_flash_decode_hb_mfma_kernel<<<gFlash, 256>>>(b_clat, b_qabs, b_q, kv_base,
+                                                                 kv_scale_base, b_pos, NH, QHD, QKN, QKR,
+                                                                 KVL, KVD, slot_stride, scale);
+                else
+                    attn_flash_decode_hb_kernel<<<gFlash, 256>>>(b_clat, b_qabs, b_q, kv_base,
+                                                                 kv_scale_base, b_pos, NH, QHD, QKN, QKR,
+                                                                 KVL, KVD, slot_stride, scale);
             } else {
                 dim3 gFlash(NH, B);
                 size_t shmem = (size_t)KVD * sizeof(float);
@@ -1268,6 +1349,48 @@ static void device_forward_absorbed_batched(Transformer *t, int B, int kv_max)
  * in lockstep (weights read once per batch). Per-slot greedy semantics match the
  * single-request reference: emit the prompt's first token, then decode until EOS
  * or the step budget. */
+/* run30: warm-up forward. Mirrors glm_inference's prefill + lockstep-decode path
+ * on a tiny dummy request (prefill NP=4 tokens in slot 0, then NEW=2 decode steps)
+ * so every hot kernel is JIT-compiled, its persistent scratch touched, and the GPU
+ * clocked up BEFORE the timed run -- keeping cold-start (first-launch compile,
+ * allocator faults, clock ramp) out of the measured throughput. Writes only slot 0
+ * of the KV cache and the transient b_* scratch, all overwritten by the real
+ * inference, so it changes no measured output. Uses the same forward helpers as
+ * glm_inference, so it also triggers their one-time env-toggle reads. */
+static void glm_warmup_forward(Transformer *t)
+{
+    enum { NP = 4, NEW = 2 };            /* prefill length, max_new_tokens */
+    if (g_cap < NP + NEW) return;        /* need room in the slot-0 cache */
+
+    int first;
+    if (g_pfbatch)
+    {
+        int pf_tok[NP], pf_seq[NP], pf_pos[NP], pf_slot[NP], pf_last[1], pf_out[1];
+        for (int j = 0; j < NP; j++) { pf_tok[j] = 0; pf_seq[j] = 0; pf_pos[j] = j; pf_slot[j] = 0; }
+        pf_last[0] = NP - 1;
+        device_forward_prefill_batched(t, NP, 1, pf_tok, pf_seq, pf_pos, pf_slot, pf_last, pf_out);
+        first = pf_out[0];
+    }
+    else
+    {
+        int pf_tok[NP];
+        for (int j = 0; j < NP; j++) pf_tok[j] = 0;
+        first = device_forward_unabsorbed(t, pf_tok, NP, 0);
+    }
+
+    int h_tok = first, h_pos = NP;
+    for (int step = 0; step < NEW; step++)
+    {
+        HIP_CHECK(hipMemcpy(b_tokens, &h_tok, sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(b_pos,    &h_pos, sizeof(int), hipMemcpyHostToDevice));
+        device_forward_absorbed_batched(t, 1, h_pos + 1);
+        HIP_CHECK(hipMemcpy(&h_tok, b_tokens, sizeof(int), hipMemcpyDeviceToHost));
+        h_pos++;
+    }
+    HIP_CHECK(hipDeviceSynchronize());
+    fprintf(stderr, "[getp] warm-up forward done (prefill %d + %d decode)\n", NP, NEW);
+}
+
 long long glm_inference(Transformer *t, Requests *reqs)
 {
     const int max_seq_len = t->config.max_seq_len;

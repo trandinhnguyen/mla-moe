@@ -974,6 +974,299 @@ __global__ void moe_grouped_mfma_i8i8_kernel(float *out_sorted, const int8_t *Xq
     }
 }
 
+/* run24: 128x128-tile variant of the W8A8 grouped MoE GEMM. Profile @ B=1024
+ * showed moe_grouped_mfma_i8i8_kernel L2-BANDWIDTH-BOUND (L2 BW 133.7% peak, MFMA
+ * only 24%); the 64x64 tile re-reads the activation ceil(N/64) times. The coarse
+ * 128x128 tile halves those re-reads (act read ceil(N/128) times), the same L2
+ * relief run21 gave the dense GEMM -- extended here to the MoE grouped GEMM (the
+ * DeepGEMM large-tile idea). Identical epilogue to moe_grouped_mfma_i8i8_kernel
+ * (expert gather via sorted_slot, scale S[col]*xsc[sr]); acc[4][4], 2x2 warp grid.
+ * A row-block beyond an expert's cnt returns early -- M-waste when cnt<128 costs
+ * only idle MFMA rows (MFMA is 24% util, not the bound), no extra L2 bytes. */
+__global__ void moe_grouped_mfma_i8i8_128_kernel(float *out_sorted, const int8_t *Xq,
+                                                 const float *xsc, const int8_t *const *Wtbl,
+                                                 const float *const *Stbl, const int *eoff,
+                                                 const int *sorted_slot, int N, int K,
+                                                 int x_stride, int gather) {
+    int e = blockIdx.z;
+    int base = eoff[e];
+    int cnt = eoff[e + 1] - base;
+    if (cnt <= 0) return;
+    int row0 = blockIdx.y * TBM2;
+    if (row0 >= cnt) return;
+    const int8_t *W = Wtbl[e];
+    const float  *S = Stbl[e];
+
+    __shared__ int8_t As[TBM2][TBK];   /* [m][k], k contiguous */
+    __shared__ int8_t Bs[TBN2][TBK];   /* [n][k], k contiguous */
+    int tx = threadIdx.x;
+    int warp = tx / 64, tiw = tx % 64;
+    int srow = (warp / 2) * 64, scol = (warp % 2) * 64;   /* 2x2 warp grid, 64x64 each */
+    int trow = tiw / 16, tcol = tiw % 16;
+    int col0 = blockIdx.x * TBN2;
+
+    i32x4b acc[4][4] = {};
+    for (int k0 = 0; k0 < K; k0 += TBK) {
+        /* A tile: 128 gathered rows, TBK=16 -> 512 int-loads / 256 threads = 2 passes. */
+#pragma unroll
+        for (int r = 0; r < TBM2; r += 64) {
+            int m = r + tx / 4, cc = (tx % 4) * 4, p = row0 + m;
+            int v = 0;
+            if (p < cnt) {
+                int sr = gather ? sorted_slot[base + p] : (base + p);
+                v = *reinterpret_cast<const int *>(&Xq[(size_t)sr * x_stride + k0 + cc]);
+            }
+            *reinterpret_cast<int *>(&As[m][cc]) = v;
+        }
+#pragma unroll
+        for (int r = 0; r < TBN2; r += 64) {
+            int n = r + tx / 4, cc = (tx % 4) * 4, gr = col0 + n;
+            int v = 0;
+            if (gr < N) v = *reinterpret_cast<const int *>(&W[(size_t)gr * K + k0 + cc]);
+            *reinterpret_cast<int *>(&Bs[n][cc]) = v;
+        }
+        __syncthreads();
+        int a[4], b[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) a[i] = *reinterpret_cast<const int *>(&As[srow + i * 16 + tcol][trow * 4]);
+#pragma unroll
+        for (int j = 0; j < 4; j++) b[j] = *reinterpret_cast<const int *>(&Bs[scol + j * 16 + tcol][trow * 4]);
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+                acc[i][j] = __builtin_amdgcn_mfma_i32_16x16x16i8(a[i], b[j], acc[i][j], 0, 0, 0);
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int prow_base = row0 + srow + i * 16 + trow * 4;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int col = col0 + scol + j * 16 + tcol;
+            if (col >= N) continue;
+            float wc = S[col];
+#pragma unroll
+            for (int e2 = 0; e2 < 4; e2++) {
+                int p = prow_base + e2;
+                if (p < cnt) {
+                    int sr = gather ? sorted_slot[base + p] : (base + p);
+                    out_sorted[(size_t)(base + p) * N + col] = (float)acc[i][j][e2] * wc * xsc[sr];
+                }
+            }
+        }
+    }
+}
+
+/* run31: TBK=64 variant of the 128x128 W8A8 MoE GEMM. Loads the A/B tiles 128-bit
+ * wide (int4 = 16 int8 per thread) and stages 64 K per iteration, so the K-loop
+ * has 4x fewer __syncthreads and load instructions than the TBK=16 kernel. The
+ * MFMA still consumes 16-K slices (4 per staged tile), so the int32 accumulation
+ * order -- and thus the output -- is BIT-IDENTICAL to moe_grouped_mfma_i8i8_128.
+ * A test of whether the narrow 32-bit int8 loads (vs the bf16 path's 128-bit)
+ * cost anything; expected ~neutral since the kernel is L2-BW-bound (bytes, not
+ * transactions). K must be a multiple of 64 (H=2048, I=1536 both are). Toggle
+ * MLA_MOE_TBK64=1. */
+#define TBK4 64
+__global__ void moe_grouped_mfma_i8i8_t64_kernel(float *out_sorted, const int8_t *Xq,
+                                                 const float *xsc, const int8_t *const *Wtbl,
+                                                 const float *const *Stbl, const int *eoff,
+                                                 const int *sorted_slot, int N, int K,
+                                                 int x_stride, int gather) {
+    int e = blockIdx.z;
+    int base = eoff[e];
+    int cnt = eoff[e + 1] - base;
+    if (cnt <= 0) return;
+    int row0 = blockIdx.y * TBM2;
+    if (row0 >= cnt) return;
+    const int8_t *W = Wtbl[e];
+    const float  *S = Stbl[e];
+
+    __shared__ int8_t As[TBM2][TBK4];   /* [m][k], k contiguous (64 wide) */
+    __shared__ int8_t Bs[TBN2][TBK4];   /* [n][k], k contiguous (64 wide) */
+    int tx = threadIdx.x;
+    int warp = tx / 64, tiw = tx % 64;
+    int srow = (warp / 2) * 64, scol = (warp % 2) * 64;
+    int trow = tiw / 16, tcol = tiw % 16;
+    int col0 = blockIdx.x * TBN2;
+
+    i32x4b acc[4][4] = {};
+    for (int k0 = 0; k0 < K; k0 += TBK4) {
+        /* A tile: 128 rows x 64 K -> 128-bit (int4 = 16 int8) loads, 4 per row. */
+#pragma unroll
+        for (int r = 0; r < TBM2; r += 64) {
+            int m = r + tx / 4, cc = (tx % 4) * 16, p = row0 + m;
+            int4 v = {0, 0, 0, 0};
+            if (p < cnt) {
+                int sr = gather ? sorted_slot[base + p] : (base + p);
+                v = *reinterpret_cast<const int4 *>(&Xq[(size_t)sr * x_stride + k0 + cc]);
+            }
+            *reinterpret_cast<int4 *>(&As[m][cc]) = v;
+        }
+#pragma unroll
+        for (int r = 0; r < TBN2; r += 64) {
+            int n = r + tx / 4, cc = (tx % 4) * 16, gr = col0 + n;
+            int4 v = {0, 0, 0, 0};
+            if (gr < N) v = *reinterpret_cast<const int4 *>(&W[(size_t)gr * K + k0 + cc]);
+            *reinterpret_cast<int4 *>(&Bs[n][cc]) = v;
+        }
+        __syncthreads();
+        /* 4 MFMA k-slices of 16 over the staged 64 (same order as TBK=16 kernel). */
+#pragma unroll
+        for (int kk = 0; kk < TBK4; kk += 16) {
+            int a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) a[i] = *reinterpret_cast<const int *>(&As[srow + i * 16 + tcol][kk + trow * 4]);
+#pragma unroll
+            for (int j = 0; j < 4; j++) b[j] = *reinterpret_cast<const int *>(&Bs[scol + j * 16 + tcol][kk + trow * 4]);
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    acc[i][j] = __builtin_amdgcn_mfma_i32_16x16x16i8(a[i], b[j], acc[i][j], 0, 0, 0);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int prow_base = row0 + srow + i * 16 + trow * 4;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int col = col0 + scol + j * 16 + tcol;
+            if (col >= N) continue;
+            float wc = S[col];
+#pragma unroll
+            for (int e2 = 0; e2 < 4; e2++) {
+                int p = prow_base + e2;
+                if (p < cnt) {
+                    int sr = gather ? sorted_slot[base + p] : (base + p);
+                    out_sorted[(size_t)(base + p) * N + col] = (float)acc[i][j][e2] * wc * xsc[sr];
+                }
+            }
+        }
+    }
+}
+
+/* run29: sign-extend a 4-bit value (0..15 nibble, two's complement) to int8. */
+__device__ __forceinline__ int i4sext(int nib) { return (int)((int8_t)(nib << 4) >> 4); }
+
+/* run29: quantize bf16 weight [N][K] to symmetric int4 PACKED [N][K/2] + per-row
+ * fp32 scale[N] (scale = max_k|w|/7; int4 range [-7,7]). Two int4 per byte: even k
+ * -> low nibble, odd k -> high nibble. K assumed even. grid=(N), block=256. This
+ * halves the weight L2 bytes vs int8 -- the bandwidth bound of the MoE GEMM. */
+__global__ void quantize_rows_i4_kernel(const bf16_t *W, int8_t *Qp, float *S,
+                                        int N, int K) {
+    int n = blockIdx.x;
+    if (n >= N) return;
+    const bf16_t *wr = W + (size_t)n * K;
+    int8_t *qr = Qp + (size_t)n * (K / 2);
+    int tid = threadIdx.x, nt = blockDim.x;
+    __shared__ float red[256];
+    float mx = 0.0f;
+    for (int k = tid; k < K; k += nt) mx = fmaxf(mx, fabsf(bf16f(wr[k])));
+    red[tid] = mx;
+    __syncthreads();
+    for (int st = nt / 2; st > 0; st >>= 1) {
+        if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
+        __syncthreads();
+    }
+    float scale = red[0] / 7.0f;
+    if (tid == 0) S[n] = scale;
+    float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+    for (int j = tid; j < K / 2; j += nt) {
+        float q0 = rintf(bf16f(wr[2 * j])     * inv);
+        float q1 = rintf(bf16f(wr[2 * j + 1]) * inv);
+        int i0 = (int)fminf(7.0f, fmaxf(-7.0f, q0));
+        int i1 = (int)fminf(7.0f, fmaxf(-7.0f, q1));
+        qr[j] = (int8_t)((i0 & 0xF) | ((i1 & 0xF) << 4));
+    }
+}
+
+/* run29: W4A8 grouped MoE GEMM -- int4 PACKED weight (per-row scale) x int8
+ * activation (per-row scale), unpacking int4->int8 in the B-tile stage then a clean
+ * int32 mfma_i32_16x16x16i8. 128x128 tile (mirrors moe_grouped_mfma_i8i8_128).
+ * Wtbl[e] points to packed int4 [N][K/2]; the logical K is passed (K even). Halves
+ * the weight L2 traffic (MoE GEMM is L2-BW-bound at B=1024). VALU headroom absorbs
+ * the nibble unpack. Toggle MLA_MOE_W4A8=1. */
+__global__ void moe_grouped_mfma_w4a8_128_kernel(float *out_sorted, const int8_t *Xq,
+                                                 const float *xsc, const int8_t *const *Wtbl,
+                                                 const float *const *Stbl, const int *eoff,
+                                                 const int *sorted_slot, int N, int K,
+                                                 int x_stride, int gather) {
+    int e = blockIdx.z;
+    int base = eoff[e];
+    int cnt = eoff[e + 1] - base;
+    if (cnt <= 0) return;
+    int row0 = blockIdx.y * TBM2;
+    if (row0 >= cnt) return;
+    const int8_t *W = Wtbl[e];        /* packed int4 [N][K/2] */
+    const float  *S = Stbl[e];
+    const int Kp = K / 2;
+
+    __shared__ int8_t As[TBM2][TBK];
+    __shared__ int8_t Bs[TBN2][TBK];
+    int tx = threadIdx.x;
+    int warp = tx / 64, tiw = tx % 64;
+    int srow = (warp / 2) * 64, scol = (warp % 2) * 64;
+    int trow = tiw / 16, tcol = tiw % 16;
+    int col0 = blockIdx.x * TBN2;
+
+    i32x4b acc[4][4] = {};
+    for (int k0 = 0; k0 < K; k0 += TBK) {
+#pragma unroll
+        for (int r = 0; r < TBM2; r += 64) {
+            int m = r + tx / 4, cc = (tx % 4) * 4, p = row0 + m;
+            int v = 0;
+            if (p < cnt) {
+                int sr = gather ? sorted_slot[base + p] : (base + p);
+                v = *reinterpret_cast<const int *>(&Xq[(size_t)sr * x_stride + k0 + cc]);
+            }
+            *reinterpret_cast<int *>(&As[m][cc]) = v;
+        }
+#pragma unroll
+        for (int r = 0; r < TBN2; r += 64) {
+            int n = r + tx / 4, cc = (tx % 4) * 4, gr = col0 + n;
+            /* 4 int8 weights (k0+cc..+3) live in 2 packed bytes at (k0+cc)/2. */
+            unsigned pk = 0;
+            if (gr < N) pk = *reinterpret_cast<const unsigned short *>(&W[(size_t)gr * Kp + ((k0 + cc) >> 1)]);
+            Bs[n][cc + 0] = (int8_t)i4sext(pk & 0xF);
+            Bs[n][cc + 1] = (int8_t)i4sext((pk >> 4) & 0xF);
+            Bs[n][cc + 2] = (int8_t)i4sext((pk >> 8) & 0xF);
+            Bs[n][cc + 3] = (int8_t)i4sext((pk >> 12) & 0xF);
+        }
+        __syncthreads();
+        int a[4], b[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) a[i] = *reinterpret_cast<const int *>(&As[srow + i * 16 + tcol][trow * 4]);
+#pragma unroll
+        for (int j = 0; j < 4; j++) b[j] = *reinterpret_cast<const int *>(&Bs[scol + j * 16 + tcol][trow * 4]);
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+                acc[i][j] = __builtin_amdgcn_mfma_i32_16x16x16i8(a[i], b[j], acc[i][j], 0, 0, 0);
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int prow_base = row0 + srow + i * 16 + trow * 4;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int col = col0 + scol + j * 16 + tcol;
+            if (col >= N) continue;
+            float wc = S[col];
+#pragma unroll
+            for (int e2 = 0; e2 < 4; e2++) {
+                int p = prow_base + e2;
+                if (p < cnt) {
+                    int sr = gather ? sorted_slot[base + p] : (base + p);
+                    out_sorted[(size_t)(base + p) * N + col] = (float)acc[i][j][e2] * wc * xsc[sr];
+                }
+            }
+        }
+    }
+}
+
 /* Quantize a bf16 weight matrix [N][K] to int8 [N][K] + per-row fp32 scale[N]
  * (symmetric, scale = max_k|w|/127). grid = (N), block = 256. One block per row. */
 __global__ void quantize_rows_i8_kernel(const bf16_t *W, int8_t *Q, float *S,
