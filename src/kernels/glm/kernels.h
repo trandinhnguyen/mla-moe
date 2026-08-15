@@ -147,10 +147,39 @@ __global__ void moe_grouped_mfma_i8i8_kernel(float *out_sorted, const int8_t *Xq
                                              const float *const *Stbl, const int *eoff,
                                              const int *sorted_slot, int N, int K,
                                              int x_stride, int gather);
+/* run24: 128x128-tile W8A8 grouped MoE GEMM. Halves the L2 activation re-reads of
+ * moe_grouped_mfma_i8i8_kernel (L2-BW-bound at B=1024, 133% peak) -- the run21
+ * tile-128 lever extended to the MoE GEMM (DeepGEMM large-tile). Bit-identical
+ * output (same fp32 K-accumulation via i32 MFMA). Toggle via MLA_MOE_T128=0. */
+__global__ void moe_grouped_mfma_i8i8_128_kernel(float *out_sorted, const int8_t *Xq,
+                                                 const float *xsc, const int8_t *const *Wtbl,
+                                                 const float *const *Stbl, const int *eoff,
+                                                 const int *sorted_slot, int N, int K,
+                                                 int x_stride, int gather);
+/* run31: TBK=64 / 128-bit-load variant of the 128x128 W8A8 MoE GEMM. Bit-identical
+ * output; 4x fewer syncs/load instructions. Test of load-width on the L2-BW-bound
+ * MoE GEMM. K multiple of 64. Toggle MLA_MOE_TBK64=1. */
+__global__ void moe_grouped_mfma_i8i8_t64_kernel(float *out_sorted, const int8_t *Xq,
+                                                 const float *xsc, const int8_t *const *Wtbl,
+                                                 const float *const *Stbl, const int *eoff,
+                                                 const int *sorted_slot, int N, int K,
+                                                 int x_stride, int gather);
 /* Quantize a bf16 weight matrix [N][K] to int8 [N][K] + per-row fp32 scale[N]
  * (symmetric, scale = max_k|w|/127). grid = (N), block = 256. */
 __global__ void quantize_rows_i8_kernel(const bf16_t *W, int8_t *Q, float *S,
                                         int N, int K);
+/* run29: quantize bf16 [N][K] to PACKED symmetric int4 [N][K/2] + per-row scale[N]
+ * (scale = max|w|/7). Halves the weight bytes for the W4A8 MoE GEMM. K even. */
+__global__ void quantize_rows_i4_kernel(const bf16_t *W, int8_t *Qp, float *S,
+                                        int N, int K);
+/* run29: W4A8 grouped MoE GEMM -- int4 packed weight x int8 activation (unpack
+ * int4->int8 in the B stage, clean int32 MFMA). Same interface/epilogue as
+ * moe_grouped_mfma_i8i8_128_kernel; Wtbl[e] is packed int4 [N][K/2], K logical. */
+__global__ void moe_grouped_mfma_w4a8_128_kernel(float *out_sorted, const int8_t *Xq,
+                                                 const float *xsc, const int8_t *const *Wtbl,
+                                                 const float *const *Stbl, const int *eoff,
+                                                 const int *sorted_slot, int N, int K,
+                                                 int x_stride, int gather);
 __global__ void moe_scatter_add_kernel(float *out, const float *down_sorted,
                                        const int *sorted_slot,
                                        const float *sorted_wt, int T, int H);
@@ -207,5 +236,14 @@ __global__ void attn_flash_decode_hb_kernel(float *clat, const float *qabs, cons
                                             const int *pos, int NH,
                                             int QHD, int QKN, int QKR, int KVL, int KVD,
                                             int slot_stride, float scale);
+/* run27: MFMA-score variant of the head-batched flash-decode. Offloads the scalar
+ * per-(head,key) KVD dot (VALU-bound at B=1024, report/run26) to the matrix cores
+ * (mfma_f32_16x16x16bf16). Same signature; softmax+clat stay scalar. MLA_FDMFMA=0
+ * reverts to attn_flash_decode_hb_kernel. */
+__global__ void attn_flash_decode_hb_mfma_kernel(float *clat, const float *qabs, const float *q,
+                                                 const int8_t *kv_base, const float *kv_scale,
+                                                 const int *pos, int NH,
+                                                 int QHD, int QKN, int QKR, int KVL, int KVD,
+                                                 int slot_stride, float scale);
 
 #endif /* MLA_KERNELS_H */
