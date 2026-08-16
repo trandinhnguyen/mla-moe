@@ -77,21 +77,39 @@ static int    g_cache_cap = 0;
  * advances all g_batch slots together (weights read once per batch). g_batch /
  * g_cap are set in warm_up; g_batch is overridable via MLA_BATCH. All decode
  * scratch below is allocated once (grow-free hot path) sized for g_batch. */
-static int    g_batch = 1024;  /* concurrent requests per group (<= this); overridable
+static int    g_batch = 1280;  /* concurrent requests per group (<= this); overridable
                                 * via MLA_BATCH. run15 (bf16 KV) freed VRAM to raise the sweet spot
                                 * 384->512; run16 made the KV cache int8 (~16GB@B=1024, quarter of the
                                 * old fp32); run17 showed a larger CLEAN group still helps. run18
-                                * (MFMA prefill flash-attention) makes prefill -- ~65% of wall time at
-                                * B=1024 -- far cheaper, so the target config per CLAUDE.md is now
-                                * B=1024 on the duplicated dataset: ~498 tok/s (acc PASS). int8 cache
-                                * (~16GB) is what makes B=1024 fit a 68GB-free GCD (VRAM caps ~1024-1280). */
+                                * (MFMA prefill flash-attention) makes prefill far cheaper. run34 chose
+                                * B=1280 on the clean-group dataset (requests_dup2odd.txt, 512x2 + 256
+                                * odd = one clean 256-multiple group); run37 pins it as the default with
+                                * the VRAM-max prefill chunk (g_pfchunk=10240): B=1280 dup2odd = 836.65
+                                * tok/s (acc PASS). NB near the VRAM ceiling on a 68GB-free GCD -- B>=1536
+                                * or g_pfchunk>=12288 OOM at B=1280; lower MLA_BATCH / MLA_PFCHUNK if a
+                                * busier shared GCD OOMs. int8 KV cache (~20GB@1280) is what makes it fit. */
 static int    g_cap   = 576;   /* per-slot cache positions (max prompt 512 + 64 steps) */
-static int    g_pfchunk = 4096; /* chunked-prefill token budget: pack whole prompts up
+static int    g_pfchunk = 10240; /* chunked-prefill token budget: pack whole prompts up
                                  * to this many tokens into one batched forward so weights
                                  * are read once per chunk (not once per request). Sizes
                                  * the MoE scratch (MR). Overridable via MLA_PFCHUNK; set 0
-                                 * (or MLA_PFBATCH=0) to fall back to per-request prefill. */
+                                 * (or MLA_PFBATCH=0) to fall back to per-request prefill.
+                                 * run35: prefill is ~85% per-token / L2-BW-bound, only ~15%
+                                 * fixed weight-stream, so bumping the chunk amortizes that
+                                 * fixed cost over fewer forwards (bit-safe: per-prompt causal,
+                                 * atomic-noise only, acc PASS). run37: the chunk max is
+                                 * VRAM-bound and shrinks as batch grows (KV cache competes) --
+                                 * at B=1280 the largest chunk that fits a 68GB-free GCD is
+                                 * ~10240 (12288 OOMs), giving 831->836.65 tok/s. Default 10240
+                                 * pairs with the default B=1280; drop it if a busier GCD OOMs. */
 static int    g_pfbatch = 1;    /* enable chunked/batched prefill (MLA_PFBATCH). */
+static int    g_chunkfuse = 0;  /* run36: interleaved chunked prefill -- fuse each decode
+                                 * step with a prefill chunk into ONE forward so the shared
+                                 * GEMM weight-streams serve both phases. Opt-in via
+                                 * MLA_CHUNKFUSE=1 (default off; run35 analysis predicts
+                                 * ~neutral at constant completion length -- measured lever). */
+static int    g_fusechunk = 4096; /* prefill tokens admitted per fused forward (MLA_FUSECHUNK).
+                                 * Kept modest so M = g_batch + g_fusechunk bounds fused scratch. */
 
 static float *b_x, *b_xb, *b_qa, *b_q, *b_comp, *b_qabs, *b_score, *b_clat;
 static float *b_ctx, *b_ao, *b_mo, *b_hb, *b_hb2, *b_shared;
@@ -131,6 +149,11 @@ static int   g_dense_w8a8 = 1;
 /* run21: route large W8A8 dense GEMMs through the 128x128-tile kernel (halves L2
  * traffic) when the coarser grid still fills the CUs. Opt-out via MLA_DENSE_T128=0. */
 static int   g_dense_t128 = 1;
+/* run33: BLOCK-WISE W4A8 dense attn projections (q_a/q_b/kv_a/o_proj): int4 weight
+ * with scale per K-group of 128. When on, the dq/ds tables hold packed int4 +
+ * [N][K/128] group scales and launch_matmul_w8a8(bw=1) routes to block-wise int4.
+ * Opt-in MLA_DENSE_W4A8_BW=1 (occupancy risk from two-level acc; see run32). */
+static int   g_dense_w4a8_bw = 0;
 static int8_t **dq_qa=NULL, **dq_qb=NULL, **dq_kva=NULL, **dq_op=NULL;
 static float  **ds_qa=NULL, **ds_qb=NULL, **ds_kva=NULL, **ds_op=NULL;
 /* run22: extend W8A8 to the remaining large bf16 GEMMs. g_ffn_w8a8 = shared-expert
@@ -146,6 +169,12 @@ static int   g_ffn_w8a8 = 1, g_lmhead_w8a8 = 0;
  * MLA_MOE_W4A8=1 (accuracy risk: int4 is coarse; measured before spreading to dense).
  * When on, the MoE expert tables (d_epq_gate/...) hold packed int4 instead of int8. */
 static int   g_moe_w4a8 = 0;
+/* run32: BLOCK-WISE W4A8 MoE (int4 weight, scale per K-group of 128). Fine-grained
+ * scale (DeepSeek/AWQ) to recover the accuracy per-row int4 lost (run29 FAILed
+ * METEOR). Opt-in MLA_MOE_W4A8_BW=1; when on the expert scale tables hold
+ * [rows][K/128] group scales and the block-wise GEMM/quant kernels are used. */
+static int   g_moe_w4a8_bw = 0;
+#define MOE_W4A8_G 128
 /* run31: TBK=64 / 128-bit-load MoE GEMM (bit-identical; 4x fewer syncs). Opt-in
  * MLA_MOE_TBK64=1 to A/B the load-width on the L2-BW-bound MoE GEMM. */
 static int   g_moe_tbk64 = 0;
@@ -176,6 +205,8 @@ enum {
     B_KVLIN, B_PLASTX, B_PSEQ, B_PPOS, B_PSLOT, B_PLAST,
     /* MFMA prefill-attention query-tile work list (run18) */
     B_QTQ0, B_QTQS, B_QTQE,
+    /* run36 interleaved chunked-prefill (fused decode+prefill) epilogue scratch */
+    B_FGIDX, B_FLOGITS, B_FOUT,
     B_NBUF
 };
 typedef struct { void *ptr; size_t bytes; } DevBuf;
@@ -459,6 +490,17 @@ static void quant_one_expert_i4(bf16_t *src, int rows, int cols, int8_t **out_q,
     HIP_CHECK(hipFree(src));
 }
 
+/* run32: quantize one bf16 expert [rows][cols] into PACKED int4 [rows][cols/2] +
+ * BLOCK-WISE fp32 scale [rows][cols/G] (G=MOE_W4A8_G), then free the bf16 source. */
+static void quant_one_expert_i4_bw(bf16_t *src, int rows, int cols, int8_t **out_q, float **out_s)
+{
+    int ng = cols / MOE_W4A8_G;
+    HIP_CHECK(hipMalloc((void **)out_q, (size_t)rows * (cols / 2) * sizeof(int8_t)));
+    HIP_CHECK(hipMalloc((void **)out_s, (size_t)rows * ng * sizeof(float)));
+    quantize_rows_i4_bw_kernel<<<rows, 256>>>(src, *out_q, *out_s, rows, cols, MOE_W4A8_G);
+    HIP_CHECK(hipFree(src));
+}
+
 /* run20: quantize a bf16 weight [rows][cols] to int8 + per-row scale but KEEP the
  * bf16 (the W8A8 path is opt-out via MLA_DENSE_W8A8=0, and lm_head still needs bf16). */
 static void quant_keep(const bf16_t *src, int rows, int cols, int8_t **out_q, float **out_s)
@@ -466,6 +508,16 @@ static void quant_keep(const bf16_t *src, int rows, int cols, int8_t **out_q, fl
     HIP_CHECK(hipMalloc((void **)out_q, (size_t)rows * cols * sizeof(int8_t)));
     HIP_CHECK(hipMalloc((void **)out_s, (size_t)rows * sizeof(float)));
     quantize_rows_i8_kernel<<<rows, 256>>>(src, *out_q, *out_s, rows, cols);
+}
+
+/* run33: block-wise int4 copy [rows][cols/2] + [rows][cols/G] group scale, KEEP
+ * bf16 (small-n / tiny-tile calls fall back to the bf16 GEMM). cols % G == 0. */
+static void quant_keep_i4_bw(const bf16_t *src, int rows, int cols, int8_t **out_q, float **out_s)
+{
+    int ng = cols / MOE_W4A8_G;
+    HIP_CHECK(hipMalloc((void **)out_q, (size_t)rows * (cols / 2) * sizeof(int8_t)));
+    HIP_CHECK(hipMalloc((void **)out_s, (size_t)rows * ng * sizeof(float)));
+    quantize_rows_i4_bw_kernel<<<rows, 256>>>(src, *out_q, *out_s, rows, cols, MOE_W4A8_G);
 }
 
 /* ==== W8A8 / INT8 QUANTIZATION TABLES (GLM-tuned optimizations) ============ */
@@ -483,13 +535,17 @@ static void build_dense_int8_tables(Transformer *t)
     dq_qb=(int8_t**)calloc(c->n_layers,sizeof(int8_t*)); ds_qb=(float**)calloc(c->n_layers,sizeof(float*));
     dq_kva=(int8_t**)calloc(c->n_layers,sizeof(int8_t*));ds_kva=(float**)calloc(c->n_layers,sizeof(float*));
     dq_op=(int8_t**)calloc(c->n_layers,sizeof(int8_t*)); ds_op=(float**)calloc(c->n_layers,sizeof(float*));
+    /* run33: block-wise int4 (scale per K-group of 128) when g_dense_w4a8_bw; all
+     * four projections' K (H, qlr=768, vdim=5120) are multiples of 128. */
+    void (*qk)(const bf16_t *, int, int, int8_t **, float **) =
+        g_dense_w4a8_bw ? quant_keep_i4_bw : quant_keep;
     for (int l = 0; l < c->n_layers; l++) {
         if (qlr > 0) {
-            quant_keep(d_w.q_a_proj[l], qlr,   H,   &dq_qa[l], &ds_qa[l]);
-            quant_keep(d_w.q_b_proj[l], q_dim, qlr, &dq_qb[l], &ds_qb[l]);
+            qk(d_w.q_a_proj[l], qlr,   H,   &dq_qa[l], &ds_qa[l]);
+            qk(d_w.q_b_proj[l], q_dim, qlr, &dq_qb[l], &ds_qb[l]);
         }
-        quant_keep(d_w.kv_a_proj[l], KVD, H,    &dq_kva[l], &ds_kva[l]);
-        quant_keep(d_w.o_proj[l],    H,   vdim, &dq_op[l],  &ds_op[l]);
+        qk(d_w.kv_a_proj[l], KVD, H,    &dq_kva[l], &ds_kva[l]);
+        qk(d_w.o_proj[l],    H,   vdim, &dq_op[l],  &ds_op[l]);
     }
     (void)KVD;
 }
@@ -562,7 +618,8 @@ static void build_moe_int8_tables(Transformer *t)
         for (int e = 0; e < NR; e++)
         {
             void (*qexp)(bf16_t *, int, int, int8_t **, float **) =
-                g_moe_w4a8 ? quant_one_expert_i4 : quant_one_expert;
+                g_moe_w4a8_bw ? quant_one_expert_i4_bw :
+                g_moe_w4a8    ? quant_one_expert_i4 : quant_one_expert;
             qexp(d_w.expert_gate[l][e], I, H, &hq_g[l][e], &hs_g[l][e]);
             qexp(d_w.expert_up[l][e],   I, H, &hq_u[l][e], &hs_u[l][e]);
             qexp(d_w.expert_down[l][e], H, I, &hq_d[l][e], &hs_d[l][e]);
@@ -641,11 +698,13 @@ void glm_warm_up(Transformer *t)
     device_malloc_model_weights(t);
     build_moe_device_tables(t);
     if (getenv("MLA_MOE_W4A8") && atoi(getenv("MLA_MOE_W4A8")) == 1) g_moe_w4a8 = 1;
+    if (getenv("MLA_MOE_W4A8_BW") && atoi(getenv("MLA_MOE_W4A8_BW")) == 1) g_moe_w4a8_bw = 1;
     if (getenv("MLA_MOE_TBK64") && atoi(getenv("MLA_MOE_TBK64")) == 1) g_moe_tbk64 = 1;
     build_moe_int8_tables(t);   /* run4: quantize experts to int8 (or int4 if g_moe_w4a8), free bf16 */
     build_wuk_transpose(t);
     if (getenv("MLA_DENSE_W8A8") && atoi(getenv("MLA_DENSE_W8A8")) == 0) g_dense_w8a8 = 0;
     if (getenv("MLA_DENSE_T128") && atoi(getenv("MLA_DENSE_T128")) == 0) g_dense_t128 = 0;
+    if (getenv("MLA_DENSE_W4A8_BW") && atoi(getenv("MLA_DENSE_W4A8_BW")) == 1) g_dense_w4a8_bw = 1;
     if (getenv("MLA_FFN_W8A8") && atoi(getenv("MLA_FFN_W8A8")) == 0) g_ffn_w8a8 = 0;
     if (getenv("MLA_LMHEAD_W8A8") && atoi(getenv("MLA_LMHEAD_W8A8")) != 0) g_lmhead_w8a8 = 1;
     if (g_dense_w8a8) build_dense_int8_tables(t);   /* run20: int8 dense projections */
@@ -675,6 +734,11 @@ void glm_warm_up(Transformer *t)
     if (env_pfb) g_pfbatch = atoi(env_pfb);
     const char *env_pfc = getenv("MLA_PFCHUNK");
     if (env_pfc) { int v = atoi(env_pfc); if (v > 0) g_pfchunk = v; }
+    /* run36 interleaved chunked prefill (fused decode+prefill). */
+    const char *env_cf = getenv("MLA_CHUNKFUSE");
+    if (env_cf) g_chunkfuse = atoi(env_cf);
+    const char *env_fc = getenv("MLA_FUSECHUNK");
+    if (env_fc) { int v = atoi(env_fc); if (v > 0) g_fusechunk = v; }
 
     const int B = g_batch, H = c->hidden_size, NH = c->n_heads;
     const int QHD = c->qk_nope_head_dim + c->qk_rope_head_dim;
@@ -703,6 +767,9 @@ void glm_warm_up(Transformer *t)
      * the largest so ffn_batched never overflows these buffers. */
     int MR = g_cap;
     if (g_pfbatch && g_pfchunk > MR) MR = g_pfchunk;
+    /* run36: a fused forward processes M = g_batch decode rows + g_fusechunk prefill
+     * rows at once, so the shared MoE scratch must hold that union. */
+    if (g_chunkfuse && g_batch + g_fusechunk > MR) MR = g_batch + g_fusechunk;
     BF(b_shared, (size_t)MR * H);
     BF(b_moelog, (size_t)MR * NR);   BF(b_topk_wt, (size_t)MR * K);
     BF(b_sorted_wt, (size_t)MR * K);
@@ -805,7 +872,7 @@ static void launch_matmul(float *Y, const float *X, const bf16_t *W, int n_rows,
  * Quantizes the fp32 activation X (K = n_in, stride x_stride) into b_act_i8 first. */
 static void launch_matmul_w8a8(float *Y, const float *X, const bf16_t *Wbf,
                                const int8_t *Wq, const float *Ws, int n_rows, int d_out,
-                               int n_in, int x_stride = -1, int y_stride = -1)
+                               int n_in, int x_stride = -1, int y_stride = -1, int bw = 0)
 {
     if (x_stride < 0) x_stride = n_in;
     if (y_stride < 0) y_stride = d_out;
@@ -815,6 +882,15 @@ static void launch_matmul_w8a8(float *Y, const float *X, const bf16_t *Wbf,
     if (Wq && n_rows >= 4)
     {
         quant_act_rows_i8_kernel<<<n_rows, 256>>>(X, b_act_i8, b_act_sc, n_rows, n_in, x_stride);
+        /* run33: block-wise int4 dense GEMM. Wq is packed int4, Ws is [d_out][n_in/128];
+         * always the 128-tile kernel (the only one that unpacks int4). n_in % 128 == 0. */
+        if (bw && g_dense_w4a8_bw)
+        {
+            dim3 grid(ceil_div(d_out, 128), ceil_div(n_rows, 128));
+            matmul_mfma_i8i8_bw_128_kernel<<<grid, 256>>>(Y, b_act_i8, b_act_sc, Wq, Ws,
+                                                          n_rows, d_out, n_in, n_in, y_stride);
+            return;
+        }
         /* run21: use the 128x128-tile kernel (half the L2 traffic) when its coarser
          * grid still fills the 104 CUs; otherwise the 64x64 kernel keeps occupancy. */
         int b128 = ceil_div(d_out, 128) * ceil_div(n_rows, 128);
@@ -870,11 +946,11 @@ static void launch_project_q(const Config *c, int l, const float *xn, float *q,
     if (c->q_lora_rank > 0)
     {
         launch_matmul_w8a8(qa_scratch, xn, d_w.q_a_proj[l], dq_qa ? dq_qa[l] : NULL,
-                           dq_qa ? ds_qa[l] : NULL, n_rows, c->q_lora_rank, c->hidden_size);
+                           dq_qa ? ds_qa[l] : NULL, n_rows, c->q_lora_rank, c->hidden_size, -1, -1, 1);
         launch_rmsnorm(qa_scratch, qa_scratch, d_w.q_a_layernorm[l], n_rows,
                        c->q_lora_rank, c->mla_norm_eps);
         launch_matmul_w8a8(q, qa_scratch, d_w.q_b_proj[l], dq_qb ? dq_qb[l] : NULL,
-                           dq_qb ? ds_qb[l] : NULL, n_rows, q_dim, c->q_lora_rank);
+                           dq_qb ? ds_qb[l] : NULL, n_rows, q_dim, c->q_lora_rank, -1, -1, 1);
     }
     else
     {
@@ -941,16 +1017,28 @@ static void ffn_batched(const Config *c, int l, const float *xn, float *out,
     if (w8a8)
     {
         quant_act_rows_i8_kernel<<<n_rows, 256>>>(xn, b_xn_i8, b_xn_scale, n_rows, H, H);
-        if (g_moe_w4a8)
+        if (g_moe_w4a8 || g_moe_w4a8_bw)
         {
-            /* run29: int4 packed weight -> must use the W4A8 kernel (128-tile). */
+            /* run29/32: int4 packed weight -> must use a W4A8 kernel (128-tile).
+             * g_moe_w4a8_bw = block-wise scale (run32); else per-row (run29). */
             dim3 gGU2(ceil_div(I, 128), ceil_div(n_rows, 128), NR);
             dim3 gD2(ceil_div(H, 128), ceil_div(n_rows, 128), NR);
-            moe_grouped_mfma_w4a8_128_kernel<<<gGU2, 256>>>(b_hbk, b_xn_i8, b_xn_scale, d_epq_gate[l], d_eps_gate[l], b_eoff, b_sorted_slot, I, H, H, 1);
-            moe_grouped_mfma_w4a8_128_kernel<<<gGU2, 256>>>(b_hb2k, b_xn_i8, b_xn_scale, d_epq_up[l], d_eps_up[l], b_eoff, b_sorted_slot, I, H, H, 1);
-            silu_mul_kernel<<<ceil_div(T * I, 256), 256>>>(b_hbk, b_hb2k, T * I);
-            quant_act_rows_i8_kernel<<<T, 256>>>(b_hbk, b_hbk_i8, b_hbk_scale, T, I, I);
-            moe_grouped_mfma_w4a8_128_kernel<<<gD2, 256>>>(b_downk, b_hbk_i8, b_hbk_scale, d_epq_down[l], d_eps_down[l], b_eoff, b_sorted_slot, H, I, I, 0);
+            if (g_moe_w4a8_bw)
+            {
+                moe_grouped_mfma_w4a8_bw_128_kernel<<<gGU2, 256>>>(b_hbk, b_xn_i8, b_xn_scale, d_epq_gate[l], d_eps_gate[l], b_eoff, b_sorted_slot, I, H, H, 1);
+                moe_grouped_mfma_w4a8_bw_128_kernel<<<gGU2, 256>>>(b_hb2k, b_xn_i8, b_xn_scale, d_epq_up[l], d_eps_up[l], b_eoff, b_sorted_slot, I, H, H, 1);
+                silu_mul_kernel<<<ceil_div(T * I, 256), 256>>>(b_hbk, b_hb2k, T * I);
+                quant_act_rows_i8_kernel<<<T, 256>>>(b_hbk, b_hbk_i8, b_hbk_scale, T, I, I);
+                moe_grouped_mfma_w4a8_bw_128_kernel<<<gD2, 256>>>(b_downk, b_hbk_i8, b_hbk_scale, d_epq_down[l], d_eps_down[l], b_eoff, b_sorted_slot, H, I, I, 0);
+            }
+            else
+            {
+                moe_grouped_mfma_w4a8_128_kernel<<<gGU2, 256>>>(b_hbk, b_xn_i8, b_xn_scale, d_epq_gate[l], d_eps_gate[l], b_eoff, b_sorted_slot, I, H, H, 1);
+                moe_grouped_mfma_w4a8_128_kernel<<<gGU2, 256>>>(b_hb2k, b_xn_i8, b_xn_scale, d_epq_up[l], d_eps_up[l], b_eoff, b_sorted_slot, I, H, H, 1);
+                silu_mul_kernel<<<ceil_div(T * I, 256), 256>>>(b_hbk, b_hb2k, T * I);
+                quant_act_rows_i8_kernel<<<T, 256>>>(b_hbk, b_hbk_i8, b_hbk_scale, T, I, I);
+                moe_grouped_mfma_w4a8_128_kernel<<<gD2, 256>>>(b_downk, b_hbk_i8, b_hbk_scale, d_epq_down[l], d_eps_down[l], b_eoff, b_sorted_slot, H, I, I, 0);
+            }
         }
         else if (t128)
         {
@@ -1057,7 +1145,7 @@ static int device_forward_unabsorbed(Transformer *t, const int *tokens, int n_pr
         launch_project_q(c, l, xb, qall, n_prompt, qa_scratch);
         launch_rope(qall + QKN, n_prompt, NH, NH * QHD, QHD, 0, QKR, c->rope_interleaved);
 
-        launch_matmul_w8a8(comp, xb, d_w.kv_a_proj[l], dq_kva?dq_kva[l]:NULL, dq_kva?ds_kva[l]:NULL, n_prompt, KVD, H);
+        launch_matmul_w8a8(comp, xb, d_w.kv_a_proj[l], dq_kva?dq_kva[l]:NULL, dq_kva?ds_kva[l]:NULL, n_prompt, KVD, H, -1, -1, 1);
         launch_rmsnorm(kvln, comp, d_w.kv_a_layernorm[l], n_prompt, KVL, c->mla_norm_eps, KVD, KVD);
         copy_strided_kernel<<<n_prompt, 256>>>(kvln + KVL, comp + KVL, QKR, KVD, KVD);
         launch_rope(kvln + KVL, n_prompt, 1, KVD, 0, 0, QKR, c->rope_interleaved);
@@ -1083,7 +1171,7 @@ static int device_forward_unabsorbed(Transformer *t, const int *tokens, int n_pr
                                                         n_prompt, NH, QHD, QKN, QKR,
                                                         KVD, VHD, scale);
         }
-        launch_matmul_w8a8(ao, ctx, d_w.o_proj[l], dq_op?dq_op[l]:NULL, dq_op?ds_op[l]:NULL, n_prompt, H, NH * VHD);
+        launch_matmul_w8a8(ao, ctx, d_w.o_proj[l], dq_op?dq_op[l]:NULL, dq_op?ds_op[l]:NULL, n_prompt, H, NH * VHD, -1, -1, 1);
         residual_add_kernel<<<ceil_div(n_prompt * H, 256), 256>>>(xs, ao, n_prompt * H);
 
         launch_rmsnorm(xb, xs, d_w.post_attn_norm[l], n_prompt, H, eps);
@@ -1194,7 +1282,7 @@ static void device_forward_prefill_batched(Transformer *t, int T, int nseq,
         rope_pos_kernel<<<dim3(T, NH), QKR / 2, rope_sh>>>(qall + QKN, NH, NH * QHD, QHD,
                                                            d_pos, QKR, c->rope_interleaved, d_inv_freq);
 
-        launch_matmul_w8a8(comp, xb, d_w.kv_a_proj[l], dq_kva?dq_kva[l]:NULL, dq_kva?ds_kva[l]:NULL, T, KVD, H);
+        launch_matmul_w8a8(comp, xb, d_w.kv_a_proj[l], dq_kva?dq_kva[l]:NULL, dq_kva?ds_kva[l]:NULL, T, KVD, H, -1, -1, 1);
         /* Build the contiguous latent KV (rmsnorm the compressed part, copy + RoPE
          * the k_pe slice at each token's own position), then scatter into slots. */
         launch_rmsnorm(kvlin, comp, d_w.kv_a_layernorm[l], T, KVL, c->mla_norm_eps, KVD, KVD);
@@ -1226,7 +1314,7 @@ static void device_forward_prefill_batched(Transformer *t, int T, int nseq,
             attn_prefill_mfma_kernel<<<dim3(n_qtile, NH), 256>>>(ctx, qall, knope, kvlin, value,
                                                                  d_qtq0, d_qtqs, d_qtqe, T, NH,
                                                                  QHD, QKN, QKR, KVD, KVL, VHD, scale);
-        launch_matmul_w8a8(ao, ctx, d_w.o_proj[l], dq_op?dq_op[l]:NULL, dq_op?ds_op[l]:NULL, T, H, NH * VHD);
+        launch_matmul_w8a8(ao, ctx, d_w.o_proj[l], dq_op?dq_op[l]:NULL, dq_op?ds_op[l]:NULL, T, H, NH * VHD, -1, -1, 1);
         residual_add_kernel<<<ceil_div(T * H, 256), 256>>>(xs, ao, T * H);
 
         launch_rmsnorm(xb, xs, d_w.post_attn_norm[l], T, H, eps);
@@ -1275,7 +1363,7 @@ static void device_forward_absorbed_batched(Transformer *t, int B, int kv_max)
             rope_pos_kernel<<<grid, QKR / 2, shmem>>>(b_q + QKN, NH, NH * QHD, QHD,
                                                       b_pos, QKR, c->rope_interleaved, d_inv_freq);
         }
-        launch_matmul_w8a8(b_comp, b_xb, d_w.kv_a_proj[l], dq_kva?dq_kva[l]:NULL, dq_kva?ds_kva[l]:NULL, B, KVD, H);
+        launch_matmul_w8a8(b_comp, b_xb, d_w.kv_a_proj[l], dq_kva?dq_kva[l]:NULL, dq_kva?ds_kva[l]:NULL, B, KVD, H, -1, -1, 1);
         kv_write_batched_kernel<<<B, 256, (size_t)KVD * sizeof(float)>>>(
                                             kv_base, kv_scale_base, slot_stride, b_pos, b_comp,
                                             d_w.kv_a_layernorm[l], KVL, QKR, KVD,
@@ -1305,10 +1393,20 @@ static void device_forward_absorbed_batched(Transformer *t, int B, int kv_max)
              * during the MFMA, M=16 pads HPB=10). Kept opt-in (MLA_FDMFMA=1) for
              * reference; the scalar-score hb kernel stays default. See report/run27. */
             static const int fdmfma = (getenv("MLA_FDMFMA") && atoi(getenv("MLA_FDMFMA")) == 1);
+            /* run38: ILP score/clat reductions (breaks the KVD=576 serial FMA chain).
+             * NEGATIVE at B=1280 (-2.6%): the kernel is LDS-OCCUPANCY-limited (occ 11.5%,
+             * "Insufficient CU LDS" 34%), not latency-throughput-bound, so the extra
+             * accumulator registers cut resident waves more than the ILP hides latency.
+             * Kept opt-in (MLA_FDILP=1) for reference; scalar hb stays default. See run38. */
+            static const int fdilp = (getenv("MLA_FDILP") && atoi(getenv("MLA_FDILP")) == 1);
             if (fdhb && NH == 20 && KVL == 512 && KVD == 576) {
                 dim3 gFlash(B, 2);   /* FD_HG = 2 head groups */
                 if (fdmfma)
                     attn_flash_decode_hb_mfma_kernel<<<gFlash, 256>>>(b_clat, b_qabs, b_q, kv_base,
+                                                                 kv_scale_base, b_pos, NH, QHD, QKN, QKR,
+                                                                 KVL, KVD, slot_stride, scale);
+                else if (fdilp)
+                    attn_flash_decode_hb_ilp_kernel<<<gFlash, 256>>>(b_clat, b_qabs, b_q, kv_base,
                                                                  kv_scale_base, b_pos, NH, QHD, QKN, QKR,
                                                                  KVL, KVD, slot_stride, scale);
                 else
@@ -1329,7 +1427,7 @@ static void device_forward_absorbed_batched(Transformer *t, int B, int kv_max)
             matmul_bh_mfma_kernel<<<grid, 256>>>(b_ctx, b_clat, d_w.W_UV[l], B, VHD, KVL,
                                                  KVL, NH * KVL, kv_stride, VHD, NH * VHD);
         }
-        launch_matmul_w8a8(b_ao, b_ctx, d_w.o_proj[l], dq_op?dq_op[l]:NULL, dq_op?ds_op[l]:NULL, B, H, NH * VHD);
+        launch_matmul_w8a8(b_ao, b_ctx, d_w.o_proj[l], dq_op?dq_op[l]:NULL, dq_op?ds_op[l]:NULL, B, H, NH * VHD, -1, -1, 1);
         residual_add_kernel<<<ceil_div(B * H, 256), 256>>>(b_x, b_ao, B * H);
 
         launch_rmsnorm(b_xb, b_x, d_w.post_attn_norm[l], B, H, eps);
@@ -1340,6 +1438,177 @@ static void device_forward_absorbed_batched(Transformer *t, int B, int kv_max)
     launch_rmsnorm(b_xb, b_x, d_w.norm, B, H, eps);
     launch_matmul_w8a8(b_logits, b_xb, d_w.lm_head, dq_lm, ds_lm, B, VOC, H);
     argmax_batched_kernel<<<B, 256>>>(b_logits, VOC, VOC, b_tokens);
+}
+
+/* run36: interleaved chunked prefill (continuous batching). ONE fused forward
+ * advances `nd` contiguous decode slots (window rows [0,nd) -> cache slots
+ * [slot0, slot0+nd)) by one token AND prefills a chunk of `T` new tokens spanning
+ * `nseq` whole prompts (rows [nd, nd+T)). Every per-row GEMM (q/kv/o_proj/FFN/MoE/
+ * lm_head) runs once over the M = nd+T concatenated rows -> a single weight-stream
+ * serves both phases instead of a separate decode pass plus a separate prefill pass.
+ * Attention splits by row range: decode rows use the absorbed flash-decode over their
+ * own KV cache; prefill rows use the causal MFMA attention over the freshly-scattered
+ * latent KV. Per-slot greedy semantics are identical to the two-phase path (each slot:
+ * prefill -> first token -> greedy decode); only the global schedule differs, so the
+ * per-request output is unchanged (modulo moe_scatter atomic order). MLA_CHUNKFUSE=1. */
+static void device_forward_fused(Transformer *t, int nd, int slot0,
+                                 int T, int nseq,
+                                 const int *pf_tokcat, const int *pf_seqstart,
+                                 const int *pf_pos, const int *pf_slot,
+                                 const int *pf_last, const int *dec_tok,
+                                 const int *dec_pos, int *dec_out, int *pf_out)
+{
+    const Config *c = &t->config;
+    const int H = c->hidden_size, NH = c->n_heads;
+    const int QKN = c->qk_nope_head_dim, QKR = c->qk_rope_head_dim, QHD = QKN + QKR;
+    const int VHD = c->v_head_dim, KVL = c->kv_lora_rank, KVD = KVL + QKR, VOC = c->vocab_size;
+    const float scale = c->softmax_scale, eps = c->rms_eps;
+    const int kv_stride = (QKN + VHD) * KVL;
+    const size_t layer_stride = (size_t)g_batch * g_cap * KVD;
+    const int slot_stride = g_cap * KVD;
+    const int inter_max = inter_max_of(c);
+    const int M = nd + T;
+    if (M <= 0) return;
+
+    /* Combined per-row index arrays: rows [0,nd) decode, rows [nd,M) prefill. */
+    static int *h_tokc = NULL, *h_posc = NULL, *h_sltc = NULL; static int h_ccap = 0;
+    if (M > h_ccap) {
+        h_tokc = (int *)realloc(h_tokc, (size_t)M * sizeof(int));
+        h_posc = (int *)realloc(h_posc, (size_t)M * sizeof(int));
+        h_sltc = (int *)realloc(h_sltc, (size_t)M * sizeof(int));
+        h_ccap = M;
+    }
+    for (int r = 0; r < nd; r++) { h_tokc[r] = dec_tok[r]; h_posc[r] = dec_pos[r]; h_sltc[r] = slot0 + r; }
+    for (int j = 0; j < T; j++)  { h_tokc[nd + j] = pf_tokcat[j]; h_posc[nd + j] = pf_pos[j]; h_sltc[nd + j] = pf_slot[j]; }
+
+    int *d_tok = (int *)sbuf(B_TOKENS, (size_t)M * sizeof(int));
+    int *d_pos = (int *)sbuf(B_PPOS,   (size_t)M * sizeof(int));
+    int *d_slt = (int *)sbuf(B_PSLOT,  (size_t)M * sizeof(int));
+    HIP_CHECK(hipMemcpy(d_tok, h_tokc, (size_t)M * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_pos, h_posc, (size_t)M * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_slt, h_sltc, (size_t)M * sizeof(int), hipMemcpyHostToDevice));
+
+    /* Prefill query-tile work list (global row = nd + prefill-local). */
+    static int *h_qtq0 = NULL, *h_qtqs = NULL, *h_qtqe = NULL; static int h_qtcap = 0;
+    int qt_bound = nseq + (T + 63) / 64 + 1;
+    if (qt_bound > h_qtcap) {
+        h_qtq0 = (int *)realloc(h_qtq0, (size_t)qt_bound * sizeof(int));
+        h_qtqs = (int *)realloc(h_qtqs, (size_t)qt_bound * sizeof(int));
+        h_qtqe = (int *)realloc(h_qtqe, (size_t)qt_bound * sizeof(int));
+        h_qtcap = qt_bound;
+    }
+    int n_qtile = 0;
+    for (int i = 0; i < nseq; i++) {
+        int e = nd + pf_last[i] + 1, s = nd + pf_seqstart[pf_last[i]];
+        for (int q0 = s; q0 < e; q0 += 64) { h_qtq0[n_qtile] = q0; h_qtqs[n_qtile] = s; h_qtqe[n_qtile] = e; n_qtile++; }
+    }
+    int *d_qtq0 = NULL, *d_qtqs = NULL, *d_qtqe = NULL;
+    if (n_qtile > 0) {
+        d_qtq0 = (int *)sbuf(B_QTQ0, (size_t)n_qtile * sizeof(int));
+        d_qtqs = (int *)sbuf(B_QTQS, (size_t)n_qtile * sizeof(int));
+        d_qtqe = (int *)sbuf(B_QTQE, (size_t)n_qtile * sizeof(int));
+        HIP_CHECK(hipMemcpy(d_qtq0, h_qtq0, (size_t)n_qtile * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_qtqs, h_qtqs, (size_t)n_qtile * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_qtqe, h_qtqe, (size_t)n_qtile * sizeof(int), hipMemcpyHostToDevice));
+    }
+
+    /* Combined M-row activation buffers (sbuf auto-grows). */
+    float *qa    = c->q_lora_rank > 0 ? (float *)sbuf(B_QA, (size_t)M * c->q_lora_rank * sizeof(float)) : NULL;
+    float *xs    = (float *)sbuf(B_XS,    (size_t)M * H * sizeof(float));
+    float *xb    = (float *)sbuf(B_XB,    (size_t)M * H * sizeof(float));
+    float *comp  = (float *)sbuf(B_COMP,  (size_t)M * KVD * sizeof(float));
+    float *qall  = (float *)sbuf(B_QALL,  (size_t)M * NH * QHD * sizeof(float));
+    float *kvlin = (float *)sbuf(B_KVLIN, (size_t)M * KVD * sizeof(float));
+    float *knope = (float *)sbuf(B_KNOPE, (size_t)NH * M * QKN * sizeof(float));
+    float *value = (float *)sbuf(B_VALUE, (size_t)NH * M * VHD * sizeof(float));
+    float *ctx   = (float *)sbuf(B_CTX,   (size_t)M * NH * VHD * sizeof(float));
+    float *ao    = (float *)sbuf(B_AO,    (size_t)M * H * sizeof(float));
+    float *mo    = (float *)sbuf(B_MO,    (size_t)M * H * sizeof(float));
+    float *hb    = (float *)sbuf(B_HB,    (size_t)M * inter_max * sizeof(float));
+    float *hb2   = (float *)sbuf(B_HB2,   (size_t)M * inter_max * sizeof(float));
+    const size_t rope_sh = c->rope_interleaved ? (size_t)QKR * sizeof(float) : 0;
+
+    embed_lookup_kernel<<<M, 256>>>(xs, d_w.embed_tokens, d_tok, H);
+
+    for (int l = 0; l < c->n_layers; l++)
+    {
+        int8_t *cache_base = d_kv_cache + (size_t)l * layer_stride;
+        float  *scale_base = d_kv_scale + (size_t)l * g_batch * g_cap;
+
+        launch_rmsnorm(xb, xs, d_w.input_layernorm[l], M, H, eps);
+        launch_project_q(c, l, xb, qall, M, qa);
+        rope_pos_kernel<<<dim3(M, NH), QKR / 2, rope_sh>>>(qall + QKN, NH, NH * QHD, QHD,
+                                                           d_pos, QKR, c->rope_interleaved, d_inv_freq);
+        launch_matmul_w8a8(comp, xb, d_w.kv_a_proj[l], dq_kva?dq_kva[l]:NULL, dq_kva?ds_kva[l]:NULL, M, KVD, H, -1, -1, 1);
+        launch_rmsnorm(kvlin, comp, d_w.kv_a_layernorm[l], M, KVL, c->mla_norm_eps, KVD, KVD);
+        copy_strided_kernel<<<M, 256>>>(kvlin + KVL, comp + KVL, QKR, KVD, KVD);
+        rope_pos_kernel<<<dim3(M, 1), QKR / 2, rope_sh>>>(kvlin + KVL, 1, KVD, 0,
+                                                          d_pos, QKR, c->rope_interleaved, d_inv_freq);
+        kv_scatter_kernel<<<M, 256>>>(cache_base, scale_base, slot_stride, d_slt, d_pos, kvlin, KVD, M);
+
+        /* ---- decode rows [0,nd): absorbed flash-decode over cache slots [slot0,..) */
+        if (nd > 0) {
+            dim3 gQ(ceil_div(KVL, MM_TILE), ceil_div(nd, MM_TILE), NH);
+            matmul_bh_mfma_kernel<<<gQ, 256>>>(b_qabs, qall, d_wuk_t[l], nd, KVL, QKN,
+                                               QHD, NH * QHD, KVL * QKN, KVL, NH * KVL);
+            int8_t *kvb = cache_base + (size_t)slot0 * slot_stride;
+            float  *scb = scale_base + (size_t)slot0 * g_cap;
+            dim3 gFlash(nd, 2);
+            static const int fdilp_f = (getenv("MLA_FDILP") && atoi(getenv("MLA_FDILP")) == 1);
+            if (fdilp_f)
+                attn_flash_decode_hb_ilp_kernel<<<gFlash, 256>>>(b_clat, b_qabs, qall, kvb, scb,
+                                                             d_pos, NH, QHD, QKN, QKR, KVL, KVD,
+                                                             slot_stride, scale);
+            else
+                attn_flash_decode_hb_kernel<<<gFlash, 256>>>(b_clat, b_qabs, qall, kvb, scb,
+                                                             d_pos, NH, QHD, QKN, QKR, KVL, KVD,
+                                                             slot_stride, scale);
+            dim3 gV(ceil_div(VHD, MM_TILE), ceil_div(nd, MM_TILE), NH);
+            matmul_bh_mfma_kernel<<<gV, 256>>>(ctx, b_clat, d_w.W_UV[l], nd, VHD, KVL,
+                                               KVL, NH * KVL, kv_stride, VHD, NH * VHD);
+        }
+        /* ---- prefill rows [nd,M): materialize per-head K/V then causal MFMA attn.
+         * knope/value are [NH][M][.] (decode rows computed too but unused). */
+        if (T > 0) {
+            dim3 gK(ceil_div(QKN, MM_TILE), ceil_div(M, MM_TILE), NH);
+            matmul_headw_mfma_kernel<<<gK, 256>>>(knope, kvlin, d_w.W_UK[l], M, QKN, KVL,
+                                                  KVD, kv_stride, M * QKN);
+            dim3 gVv(ceil_div(VHD, MM_TILE), ceil_div(M, MM_TILE), NH);
+            matmul_headw_mfma_kernel<<<gVv, 256>>>(value, kvlin, d_w.W_UV[l], M, VHD, KVL,
+                                                   KVD, kv_stride, M * VHD);
+            attn_prefill_mfma_kernel<<<dim3(n_qtile, NH), 256>>>(ctx, qall, knope, kvlin, value,
+                                                                 d_qtq0, d_qtqs, d_qtqe, M, NH,
+                                                                 QHD, QKN, QKR, KVD, KVL, VHD, scale);
+        }
+
+        launch_matmul_w8a8(ao, ctx, d_w.o_proj[l], dq_op?dq_op[l]:NULL, dq_op?ds_op[l]:NULL, M, H, NH * VHD, -1, -1, 1);
+        residual_add_kernel<<<ceil_div(M * H, 256), 256>>>(xs, ao, M * H);
+        launch_rmsnorm(xb, xs, d_w.post_attn_norm[l], M, H, eps);
+        ffn_batched(c, l, xb, mo, M, hb, hb2);
+        residual_add_kernel<<<ceil_div(M * H, 256), 256>>>(xs, mo, M * H);
+    }
+
+    /* Epilogue: greedy token for every decode row [0,nd) + first token for each
+     * prefill prompt (its last row = nd + pf_last[i]). One gathered lm_head. */
+    int ng = nd + nseq;
+    static int *h_gidx = NULL; static int h_gcap = 0;
+    if (ng > h_gcap) { h_gidx = (int *)realloc(h_gidx, (size_t)ng * sizeof(int)); h_gcap = ng; }
+    for (int r = 0; r < nd; r++) h_gidx[r] = r;
+    for (int i = 0; i < nseq; i++) h_gidx[nd + i] = nd + pf_last[i];
+    int *d_gidx = (int *)sbuf(B_FGIDX, (size_t)ng * sizeof(int));
+    HIP_CHECK(hipMemcpy(d_gidx, h_gidx, (size_t)ng * sizeof(int), hipMemcpyHostToDevice));
+    float *gbuf = (float *)sbuf(B_PLASTX, (size_t)ng * H * sizeof(float));
+    float *glog = (float *)sbuf(B_FLOGITS, (size_t)ng * VOC * sizeof(float));
+    int   *gout = (int *)sbuf(B_FOUT, (size_t)ng * sizeof(int));
+    gather_rows_kernel<<<ng, 256>>>(gbuf, xs, d_gidx, H);
+    launch_rmsnorm(xb, gbuf, d_w.norm, ng, H, eps);
+    launch_matmul_w8a8(glog, xb, d_w.lm_head, dq_lm, ds_lm, ng, VOC, H);
+    argmax_batched_kernel<<<ng, 256>>>(glog, VOC, VOC, gout);
+    static int *h_gout = NULL; static int h_gocap = 0;
+    if (ng > h_gocap) { h_gout = (int *)realloc(h_gout, (size_t)ng * sizeof(int)); h_gocap = ng; }
+    HIP_CHECK(hipMemcpy(h_gout, gout, (size_t)ng * sizeof(int), hipMemcpyDeviceToHost));
+    for (int r = 0; r < nd; r++)   dec_out[r] = h_gout[r];
+    for (int i = 0; i < nseq; i++) pf_out[i]  = h_gout[nd + i];
 }
 
 /* ==== INFERENCE DRIVER (batched prefill + lockstep decode) ================= */
@@ -1438,6 +1707,10 @@ long long glm_inference(Transformer *t, Requests *reqs)
     int *pf_cslot= (int *)malloc((size_t)g_batch * sizeof(int));
     int *pf_cnp  = (int *)malloc((size_t)g_batch * sizeof(int));
     int *pf_out  = (int *)malloc((size_t)g_batch * sizeof(int));
+    /* run36 fused decode-window scratch. */
+    int *dec_tok = (int *)malloc((size_t)g_batch * sizeof(int));
+    int *dec_pos = (int *)malloc((size_t)g_batch * sizeof(int));
+    int *dec_out = (int *)malloc((size_t)g_batch * sizeof(int));
 
     long long total = 0;
 
@@ -1473,6 +1746,95 @@ long long glm_inference(Transformer *t, Requests *reqs)
             h_pos[i]   = np;
             done[i]    = (st <= 0 || tok0 == eos);
         };
+
+        /* run36: interleaved chunked prefill. Admit slots in order; each super-step
+         * runs ONE fused forward = decode(active window [Dwin,A)) + prefill(next chunk
+         * [A,newA)). Cache slots used per step are contiguous [Dwin,newA). Per-slot
+         * greedy semantics are identical to the two-phase path (prefill -> first token
+         * -> decode); only the schedule differs. MLA_CHUNKFUSE=1. */
+        if (g_chunkfuse)
+        {
+            int A = 0;   /* next slot to admit (group-local, in `order`) */
+            while (true)
+            {
+                int Dwin = 0;
+                while (Dwin < A && done[Dwin]) Dwin++;   /* window start = first non-done */
+                int nd = A - Dwin;                        /* contiguous; done slots masked */
+
+                /* Pack a prefill chunk of whole prompts up to g_fusechunk tokens. */
+                int T = 0, nseq = 0, i = A;
+                while (i < Bg)
+                {
+                    if (done[i]) { i++; continue; }       /* empty prompt already finished */
+                    int np = plen[order[base + i]];
+                    if (nseq > 0 && T + np > g_fusechunk) break;
+                    int *tk = ptok[order[base + i]];
+                    for (int j = 0; j < np; j++)
+                    {
+                        pf_tok[T + j]  = tk[j];
+                        pf_seq[T + j]  = T;               /* prefill-local prompt start */
+                        pf_pos[T + j]  = j;               /* within-prompt position     */
+                        pf_slot[T + j] = i;               /* cache slot = group slot i  */
+                    }
+                    pf_last[nseq]  = T + np - 1;
+                    pf_cslot[nseq] = i;
+                    pf_cnp[nseq]   = np;
+                    T += np; nseq++; i++;
+                }
+                int newA = i;
+
+                if (nd == 0 && nseq == 0)
+                {   /* nothing active and nothing packable: skip trailing empties */
+                    A = newA;
+                    if (A >= Bg) break;
+                    continue;
+                }
+
+                /* Snapshot the decode window's current token/pos, then emit the current
+                 * token for still-active slots (mirrors the lockstep emit-before-step). */
+                for (int r = 0; r < nd; r++)
+                {
+                    int s = Dwin + r, p = h_pos[s];
+                    if (p >= g_cap) p = g_cap - 1;        /* clamp done slots (KV OOB guard) */
+                    dec_tok[r] = h_tok[s];
+                    dec_pos[r] = p;
+                }
+                for (int r = 0; r < nd; r++)
+                {
+                    int s = Dwin + r;
+                    if (!done[s]) reqs->out_tokens[slot_req[s]][slot_nout[s]++] = h_tok[s];
+                }
+
+                device_forward_fused(t, nd, Dwin, T, nseq,
+                                     pf_tok, pf_seq, pf_pos, pf_slot, pf_last,
+                                     dec_tok, dec_pos, dec_out, pf_out);
+
+                for (int r = 0; r < nd; r++)
+                {
+                    int s = Dwin + r;
+                    if (done[s]) continue;
+                    h_tok[s] = dec_out[r];
+                    h_pos[s]++;
+                    if (slot_nout[s] >= slot_st[s] || h_tok[s] == eos) done[s] = 1;
+                }
+                for (int c2 = 0; c2 < nseq; c2++)
+                    set_slot(pf_cslot[c2], pf_cnp[c2], pf_out[c2]);
+                A = newA;
+
+                if (A >= Bg)
+                {
+                    int any = 0;
+                    for (int s = 0; s < Bg; s++) if (!done[s]) { any = 1; break; }
+                    if (!any) break;
+                }
+            }
+            for (int i2 = 0; i2 < Bg; i2++)
+            {
+                reqs->out_lens[slot_req[i2]] = slot_nout[i2];
+                total += slot_nout[i2];
+            }
+            continue;   /* group handled entirely by the fused scheduler */
+        }
 
         if (g_pfbatch)
         {
@@ -1580,5 +1942,6 @@ long long glm_inference(Transformer *t, Requests *reqs)
     free(h_tok); free(h_pos); free(done);
     free(pf_tok); free(pf_seq); free(pf_pos); free(pf_slot);
     free(pf_last); free(pf_cslot); free(pf_cnp); free(pf_out);
+    free(dec_tok); free(dec_pos); free(dec_out);
     return total;
 }

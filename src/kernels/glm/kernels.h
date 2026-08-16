@@ -156,6 +156,11 @@ __global__ void moe_grouped_mfma_i8i8_128_kernel(float *out_sorted, const int8_t
                                                  const float *const *Stbl, const int *eoff,
                                                  const int *sorted_slot, int N, int K,
                                                  int x_stride, int gather);
+/* run33: block-wise W4A8 dense GEMM (packed int4 weight [N][K/2], scale [N][K/128]).
+ * Two-level accumulation (int32 mfma per group -> float flush). MLA_DENSE_W4A8_BW=1. */
+__global__ void matmul_mfma_i8i8_bw_128_kernel(float *Y, const int8_t *Xq, const float *xsc,
+                                               const int8_t *W, const float *wsc, int M, int N,
+                                               int K, int x_stride, int y_stride);
 /* run31: TBK=64 / 128-bit-load variant of the 128x128 W8A8 MoE GEMM. Bit-identical
  * output; 4x fewer syncs/load instructions. Test of load-width on the L2-BW-bound
  * MoE GEMM. K multiple of 64. Toggle MLA_MOE_TBK64=1. */
@@ -180,6 +185,20 @@ __global__ void moe_grouped_mfma_w4a8_128_kernel(float *out_sorted, const int8_t
                                                  const float *const *Stbl, const int *eoff,
                                                  const int *sorted_slot, int N, int K,
                                                  int x_stride, int gather);
+/* run32: BLOCK-WISE int4 quant -- symmetric packed int4 [N][K/2] but scale is
+ * per (row, K-group of G): S is [N][K/G]. Fine-grained scale (DeepSeek/AWQ style)
+ * recovers the accuracy per-row int4 lost (run29). K multiple of G. grid=(N). */
+__global__ void quantize_rows_i4_bw_kernel(const bf16_t *W, int8_t *Qp, float *S,
+                                           int N, int K, int G);
+/* run32: block-wise W4A8 grouped MoE GEMM. Same tile/unpack as the per-row w4a8
+ * kernel but the weight scale varies per K-group -> two-level accumulation: int32
+ * MFMA within a group, flushed into a float accumulator scaled by S[col][group],
+ * reset, next group. S is [N][K/G]. Toggle MLA_MOE_W4A8_BW=1. */
+__global__ void moe_grouped_mfma_w4a8_bw_128_kernel(float *out_sorted, const int8_t *Xq,
+                                                    const float *xsc, const int8_t *const *Wtbl,
+                                                    const float *const *Stbl, const int *eoff,
+                                                    const int *sorted_slot, int N, int K,
+                                                    int x_stride, int gather);
 __global__ void moe_scatter_add_kernel(float *out, const float *down_sorted,
                                        const int *sorted_slot,
                                        const float *sorted_wt, int T, int H);

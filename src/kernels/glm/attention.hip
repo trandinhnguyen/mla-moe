@@ -556,6 +556,108 @@ __global__ void attn_flash_decode_hb_kernel(float *clat, const float *qabs, cons
     }
 }
 
+/* run38: ILP variant of attn_flash_decode_hb_kernel. run26 profile showed the
+ * head-batched decode is LATENCY/occupancy-bound (VALU 43.6% NOT saturated, occ
+ * 22%, IPC 0.63) -- not compute-bound (so run27's MFMA-score lost). The dominant
+ * VALU work is the per-(head,key) score dot: a KVD=576-long reduction into ONE
+ * accumulator, i.e. a 576-deep serial FMA dependency chain that stalls on FMA
+ * latency (low IPC). This breaks that chain with 4 independent accumulators (ILP)
+ * so 4 FMAs are in flight -- pure latency relief, no MFMA, no extra LDS, no
+ * occupancy change. Same idea on the clat tk-reduction (32-deep). NOT bit-identical
+ * (fp add reassociation), but numerically equivalent (accuracy-safe, gate-checked).
+ * Toggle MLA_FDILP=0 reverts to the single-accumulator attn_flash_decode_hb_kernel. */
+__global__ void attn_flash_decode_hb_ilp_kernel(float *clat, const float *qabs, const float *q,
+                                            const int8_t *kv_base, const float *kv_scale,
+                                            const int *pos, int NH, int QHD, int QKN, int QKR,
+                                            int KVL, int KVD, int slot_stride, float scale) {
+    const int s = blockIdx.x, g = blockIdx.y;
+    const int h0 = g * FD_HPB;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    (void)NH; (void)QKR; (void)KVL; (void)KVD;
+    const int kv_len = pos[s] + 1;
+    const int8_t *ckvb  = kv_base  + (size_t)s * slot_stride;
+    const float  *scl_s = kv_scale + (size_t)s * (slot_stride / FD_KVD);
+
+    __shared__ __bf16 Qsh[FD_HPB * FD_KVD];
+    __shared__ int8_t Ksh[FD_TK * FD_KVD];
+    __shared__ float  Kscl[FD_TK];
+    __shared__ float  Ssh[FD_HPB * FD_TK];
+    __shared__ float  Msh[FD_HPB], Lsh[FD_HPB], Csh[FD_HPB];
+
+    float oacc[FD_OACC];
+#pragma unroll
+    for (int e = 0; e < FD_OACC; e++) oacc[e] = 0.0f;
+    if (tid < FD_HPB) { Msh[tid] = -INFINITY; Lsh[tid] = 0.0f; }
+
+    for (int i = tid; i < FD_HPB * FD_KVD; i += nt) {
+        int h = i / FD_KVD, d = i % FD_KVD, hg = h0 + h;
+        float v = (d < FD_KVL) ? qabs[((size_t)s * FD_NH + hg) * FD_KVL + d]
+                               : q[((size_t)s * FD_NH + hg) * QHD + QKN + (d - FD_KVL)];
+        Qsh[i] = (__bf16)v;
+    }
+    __syncthreads();
+
+    for (int k0 = 0; k0 < kv_len; k0 += FD_TK) {
+        const int tk = (kv_len - k0 < FD_TK) ? (kv_len - k0) : FD_TK;
+        for (int i = tid; i < tk * FD_KVD; i += nt) Ksh[i] = ckvb[(size_t)k0 * FD_KVD + i];
+        for (int j = tid; j < tk; j += nt) Kscl[j] = scl_s[k0 + j];
+        __syncthreads();
+        /* scores: 4-way ILP over the KVD=576 reduction (breaks the serial FMA chain). */
+        for (int hk = tid; hk < FD_HPB * tk; hk += nt) {
+            int h = hk / tk, k = hk % tk;
+            const __bf16 *qh = Qsh + (size_t)h * FD_KVD;
+            const int8_t *kk = Ksh + (size_t)k * FD_KVD;
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+#pragma unroll 4
+            for (int i = 0; i < FD_KVD; i += 4) {   /* FD_KVD=576 divisible by 4 */
+                d0 += (float)qh[i]     * (float)kk[i];
+                d1 += (float)qh[i + 1] * (float)kk[i + 1];
+                d2 += (float)qh[i + 2] * (float)kk[i + 2];
+                d3 += (float)qh[i + 3] * (float)kk[i + 3];
+            }
+            Ssh[h * FD_TK + k] = ((d0 + d1) + (d2 + d3)) * Kscl[k] * scale;
+        }
+        __syncthreads();
+        if (tid < FD_HPB) {
+            int h = tid;
+            float tmax = -INFINITY;
+            for (int k = 0; k < tk; k++) tmax = fmaxf(tmax, Ssh[h * FD_TK + k]);
+            float mo = Msh[h], mn = fmaxf(mo, tmax);
+            float corr = (mo == -INFINITY) ? 0.0f : __expf(mo - mn);
+            float sum = 0.0f;
+            for (int k = 0; k < tk; k++) { float p = __expf(Ssh[h * FD_TK + k] - mn); Ssh[h * FD_TK + k] = p; sum += p; }
+            Lsh[h] = Lsh[h] * corr + sum; Msh[h] = mn; Csh[h] = corr;
+        }
+        __syncthreads();
+        int idx = tid;
+#pragma unroll
+        for (int e = 0; e < FD_OACC; e++, idx += nt) {
+            if (idx < FD_HPB * FD_KVL) {
+                int h = idx / FD_KVL, r = idx % FD_KVL;
+                float a0 = 0.0f, a1 = 0.0f;
+                int k = 0;
+                for (; k + 1 < tk; k += 2) {
+                    a0 += Ssh[h * FD_TK + k]     * Kscl[k]     * (float)Ksh[(size_t)k * FD_KVD + r];
+                    a1 += Ssh[h * FD_TK + k + 1] * Kscl[k + 1] * (float)Ksh[(size_t)(k + 1) * FD_KVD + r];
+                }
+                for (; k < tk; k++)
+                    a0 += Ssh[h * FD_TK + k] * Kscl[k] * (float)Ksh[(size_t)k * FD_KVD + r];
+                oacc[e] = oacc[e] * Csh[h] + (a0 + a1);
+            }
+        }
+        __syncthreads();
+    }
+    int idx = tid;
+#pragma unroll
+    for (int e = 0; e < FD_OACC; e++, idx += nt) {
+        if (idx < FD_HPB * FD_KVL) {
+            int h = idx / FD_KVL, r = idx % FD_KVL, hg = h0 + h;
+            float inv = (Lsh[h] > 0.0f) ? 1.0f / Lsh[h] : 0.0f;
+            clat[((size_t)s * FD_NH + hg) * FD_KVL + r] = oacc[e] * inv;
+        }
+    }
+}
+
 /* run27: MFMA-score variant of attn_flash_decode_hb_kernel. Profile @ B=1024
  * (report/run26) showed the head-batched decode is now VALU-BOUND (VALU 43.6%,
  * MFMA 0%, L2 2.6% -- run23 head-batching killed the L2-read bound): the scalar
