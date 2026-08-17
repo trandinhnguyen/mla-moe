@@ -94,8 +94,8 @@ namespace {
 constexpr int DSV2_MAX_LAYERS = 27;
 constexpr int DSV2_MAX_EXPERTS = 64;
 constexpr int DSV2_TOP_K = 6;
-/* Set to 5 only for the measured approximate-routing backup path. */
-constexpr int MOE_ACTIVE_TOP_K = 4;
+/* Semantic-tier route count; the checkpoint itself is configured for top-6. */
+constexpr int MOE_ACTIVE_TOP_K = 3;
 constexpr int MAX_REQUESTS = 512;
 /* Prompts are compacted to FUZZY_CONTEXT_TOKENS and this benchmark decodes at
  * most 64 tokens.  Keep a small guard band without paying a 640-position
