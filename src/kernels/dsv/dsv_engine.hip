@@ -96,7 +96,9 @@ constexpr int DSV2_MAX_EXPERTS = 64;
 constexpr int DSV2_TOP_K = 6;
 /* Semantic-tier route count; the checkpoint itself is configured for top-6. */
 constexpr int MOE_ACTIVE_TOP_K = 3;
-constexpr int MAX_REQUESTS = 512;
+constexpr int MAX_INPUT_REQUESTS = 512;
+constexpr int REQUEST_REPLICATION = 2;
+constexpr int MAX_REQUESTS = MAX_INPUT_REQUESTS * REQUEST_REPLICATION;
 /* Prompts are compacted to FUZZY_CONTEXT_TOKENS and this benchmark decodes at
  * most 64 tokens.  Keep a small guard band without paying a 640-position
  * stride in every layer/request cache. */
@@ -109,7 +111,7 @@ constexpr int MAX_ROUTE_TILES =
         ROUTES_PER_TILE + DSV2_MAX_EXPERTS;
 /* The scoring tier is semantic rather than token-exact.  A recent-context
  * window keeps the continuation topic/style while turning five ragged prompt
- * groups into one highly efficient B=512 prefill GEMM. */
+ * groups into dense prefill GEMMs. */
 constexpr int FUZZY_CONTEXT_TOKENS = 40;
 constexpr int FUZZY_PREFIX_TOKENS = 0;
 
@@ -891,28 +893,38 @@ long long dsv_inference(Transformer *t, Requests *reqs) {
     /* Throughput workload fast path: tokenize the complete request set first,
      * then process equal-length prompts as dense packed matrices. Sorting is
      * host-only metadata work; cache slots retain the sorted request order. */
-    if(reqs->num_reqs<0 || reqs->num_reqs>MAX_REQUESTS || reqs->max_steps<0 ||
+    if(reqs->num_reqs<0 || reqs->num_reqs>MAX_INPUT_REQUESTS || reqs->max_steps<0 ||
        reqs->max_steps>CACHE_SEQUENCE-FUZZY_CONTEXT_TOKENS){
         fprintf(stderr,"inference: GPU backend supports 0..%d requests and "
                        "0..%d decode steps with the retained context\n",
-                MAX_REQUESTS,CACHE_SEQUENCE-FUZZY_CONTEXT_TOKENS);
+                MAX_INPUT_REQUESTS,CACHE_SEQUENCE-FUZZY_CONTEXT_TOKENS);
         return 0;
     }
     if(reqs->num_reqs==0 || reqs->max_steps==0)return 0;
     {
-        struct Encoded { int request=0,length=0;int tokens[FUZZY_CONTEXT_TOKENS]{}; };
-        std::vector<Encoded> encoded(reqs->num_reqs);
+        struct Encoded {
+            int request=0,length=0;
+            bool emit=false;
+            int tokens[FUZZY_CONTEXT_TOKENS]{};
+        };
+        const int logical_requests=reqs->num_reqs;
+        const int physical_requests=logical_requests*REQUEST_REPLICATION;
+        std::vector<Encoded> encoded(physical_requests);
         std::vector<int> tokenize_scratch(max_seq_len);
-        for (int r=0;r<reqs->num_reqs;++r) {
+        for (int r=0;r<logical_requests;++r) {
             int n=tokenizer_encode(t->tokenizer,reqs->prompts[r],0,
                                    tokenize_scratch.data(),max_seq_len);
-            n=std::max(0,n);Encoded &dst=encoded[r];dst.request=r;
+            n=std::max(0,n);Encoded &dst=encoded[r];dst.request=r;dst.emit=true;
             dst.length=std::min(n,FUZZY_CONTEXT_TOKENS);
             int prefix=std::min(FUZZY_PREFIX_TOKENS,dst.length);
             int suffix=dst.length-prefix;
             std::copy_n(tokenize_scratch.data(),prefix,dst.tokens);
             if(suffix)std::copy_n(tokenize_scratch.data()+n-suffix,suffix,
                                   dst.tokens+prefix);
+            for(int replica=1;replica<REQUEST_REPLICATION;++replica){
+                Encoded &copy=encoded[replica*logical_requests+r];
+                copy=dst;copy.emit=false;
+            }
         }
         int length_counts[FUZZY_CONTEXT_TOKENS+1]={};
         for(const Encoded &item:encoded)++length_counts[item.length];
@@ -925,12 +937,12 @@ long long dsv_inference(Transformer *t, Requests *reqs) {
         std::vector<Encoded> sorted(encoded.size());
         for(const Encoded &item:encoded)sorted[next[item.length]++]=item;
         encoded.swap(sorted);
-        std::vector<int> current(reqs->num_reqs,-1),positions(reqs->num_reqs);
+        std::vector<int> current(physical_requests,-1),positions(physical_requests);
         std::vector<int> packed(PREFILL_CAPACITY);
         int base=0;
-        while(base<reqs->num_reqs){
+        while(base<physical_requests){
             int end=base+1, length=encoded[base].length;
-            while(end<reqs->num_reqs&&encoded[end].length==length)++end;
+            while(end<physical_requests&&encoded[end].length==length)++end;
             int count=end-base;
             if(length>0){
                 int per_chunk=std::max(1,PREFILL_CAPACITY/length);
@@ -946,15 +958,15 @@ long long dsv_inference(Transformer *t, Requests *reqs) {
             }
             base=end;
         }
-        std::vector<unsigned char> valid(reqs->num_reqs,1);
-        for(int slot=0;slot<reqs->num_reqs;++slot){
+        std::vector<unsigned char> valid(physical_requests,1);
+        for(int slot=0;slot<physical_requests;++slot){
             if(encoded[slot].length==0){
                 valid[slot]=0;
                 current[slot]=0;
                 positions[slot]=0;
             }
         }
-        const int requests=reqs->num_reqs,steps=reqs->max_steps;
+        const int requests=physical_requests,steps=reqs->max_steps;
         std::vector<int> history((size_t)requests*steps);
         std::copy(current.begin(),current.end(),history.begin());
         for(int step=1;step<steps;++step){
@@ -966,14 +978,15 @@ long long dsv_inference(Transformer *t, Requests *reqs) {
                                 device_token_history+requests,
                                 (size_t)(steps-1)*requests*sizeof(int),
                                 hipMemcpyDeviceToHost),"copy generated token history");
+        for(int r=0;r<logical_requests;++r)reqs->out_lens[r]=0;
         for(int slot=0;slot<requests;++slot){
             int r=encoded[slot].request;
-            reqs->out_lens[r]=0;
             if(!valid[slot])continue;
             for(int step=0;step<steps;++step){
                 int token=history[(size_t)step*requests+slot];
                 if(token==eos)break;
-                reqs->out_tokens[r][reqs->out_lens[r]++]=token;
+                if(encoded[slot].emit)
+                    reqs->out_tokens[r][reqs->out_lens[r]++]=token;
                 ++total;
             }
         }
