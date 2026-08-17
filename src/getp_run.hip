@@ -27,8 +27,6 @@
 
 extern "C" {
 void dsv2_launch_batched_matvec(float *,const float *,const uint16_t *,int,int,int,hipStream_t);
-void dsv2_prepare_batched_bf16(const float *,int,int,hipStream_t);
-void dsv2_launch_prepared_matvec(float *,const uint16_t *,int,int,int,hipStream_t);
 void dsv2_launch_batched_lm_argmax_partials(float *,int *,const float *,
                                              const uint16_t *,int,int,int,hipStream_t);
 void dsv2_launch_lm_argmax_i8(float *,int *,int8_t *,float *,const float *,
@@ -74,13 +72,9 @@ void dsv2_launch_grouped_expert_down_i8_native(float *,const int8_t *,
     const int *,const int *,const int *,int,int,int,hipStream_t);
 void dsv2_launch_single_down_i8(float *,const int8_t *,const float *,
     const int8_t *,const float *,int,int,int,hipStream_t);
-void dsv2_launch_single_gate_up(uint16_t *,const uint16_t *,const uint16_t *,
-    const uint16_t *,int,int,int,hipStream_t);
 void dsv2_launch_single_gate_up_i8(uint16_t *,const int8_t *,const float *,
     const int8_t *,const int8_t *,const float *,const float *,int,int,int,
     hipStream_t);
-void dsv2_launch_bf16_input_matvec(float *,const uint16_t *,const uint16_t *,
-    int,int,int,hipStream_t);
 void dsv2_init_mfma_gemm(size_t);
 void dsv2_finish_mfma_gemm();
 }
@@ -139,6 +133,8 @@ struct DeviceLayer {
           *dense_down_scales = nullptr;
     uint16_t *router = nullptr, *shared_gate = nullptr, *shared_up = nullptr,
              *shared_down = nullptr;
+    int8_t *router_i8 = nullptr;
+    float *router_scales = nullptr;
     uint16_t *expert_gate[DSV2_MAX_EXPERTS]{};
     uint16_t *expert_up[DSV2_MAX_EXPERTS]{};
     uint16_t *expert_down[DSV2_MAX_EXPERTS]{};
@@ -388,6 +384,12 @@ void upload_model_weights(Transformer *t) {
 
     for (int l = c.first_k_dense; l < c.n_layers; ++l) {
         DeviceLayer &d = gpu_model.layer[l];
+        d.router_i8=device_allocate<int8_t>((size_t)c.n_routed_experts*H,
+                                            "allocate INT8 router");
+        d.router_scales=device_allocate<float>(c.n_routed_experts,
+                                               "allocate router scales");
+        quantize_staged(w.moe_gate[l],d.router_i8,d.router_scales,
+                        c.n_routed_experts,H);
         size_t shared_down_elements=(size_t)H*SHARED;
         d.shared_down_i8=device_allocate<int8_t>(shared_down_elements,
                                                   "allocate INT8 shared down");
@@ -584,25 +586,6 @@ void gpu_lm_argmax(const float *input,const uint16_t *weight,int batch,
     batched_partial_argmax<<<batch,256,0,0>>>(values,indices,tiles,device_token);
 }
 
-void gpu_swiglu_batch(float *output, const float *input,
-                      const uint16_t *gate, const uint16_t *up,
-                      const uint16_t *down, int batch, int intermediate,
-                      int hidden) {
-    /* The old dual matvec kernel was route/token parallel but performed scalar
-     * dot products. Chunking lets all three projections use the MFMA GEMM path
-     * without allocating full-bucket gate and up tensors. */
-    for(int start=0;start<batch;start+=8192){
-        int n=std::min(8192,batch-start);
-        const float *x=input+(size_t)start*hidden;
-        dsv2_prepare_batched_bf16(x,n,hidden,0);
-        auto *fused=gpu_state.dense_fused_gate;
-        dsv2_launch_single_gate_up(fused,nullptr,gate,up,n,intermediate,hidden,0);
-        /* single_gate_up consumes the globally prepared MFMA input. */
-        dsv2_launch_bf16_input_matvec(output+(size_t)start*hidden,fused,down,
-                                      n,hidden,intermediate,0);
-    }
-}
-
 void gpu_swiglu_batch_i8(float *output,const float *input,DeviceLayer &w,
                          int batch,int intermediate,int hidden){
     for(int start=0;start<batch;start+=MOE_CHUNK_TOKENS){
@@ -627,7 +610,6 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
                    float *output,int batch){
     const int H=c.hidden_size,K=MOE_ACTIVE_TOP_K;
     const int SHARED=c.n_shared_experts*c.moe_inter_size;
-    dsv2_prepare_batched_bf16(input,batch,H,0);
     hip_check(hipEventRecord(moe_input_ready,0),"record MoE input ready");
     hip_check(hipStreamWaitEvent(shared_expert_stream,moe_input_ready,0),
               "wait for MoE input on shared stream");
@@ -644,8 +626,11 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
     dsv2_launch_single_down_i8(output,gpu_state.shared_i8,
         gpu_state.shared_i8_scales,w.shared_down_i8,w.shared_down_scales,
         batch,H,SHARED,shared_expert_stream);
-    dsv2_launch_prepared_matvec(gpu_state.prouter,w.router,batch,
-                               c.n_routed_experts,H,0);
+    dsv2_launch_quantize_rows_i8(gpu_state.projection_i8,
+        gpu_state.projection_i8_scales,input,batch,H,0);
+    dsv2_launch_single_down_i8(gpu_state.prouter,gpu_state.projection_i8,
+        gpu_state.projection_i8_scales,w.router_i8,w.router_scales,batch,
+        c.n_routed_experts,H,0);
     dsv2_launch_batched_router_topk(gpu_state.prouter,batch,c.n_routed_experts,K,
         gpu_state.ptopk_index,gpu_state.ptopk_weight,gpu_state.expert_counts,0);
     int route_tile=128;
