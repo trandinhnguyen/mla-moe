@@ -10,17 +10,23 @@
  * Everything GLM-owned lives under src/kernels/glm (so the DeepSeek optimizer
  * only ever touches src/kernels/dsv, and vice versa):
  *   src/kernels/glm/kernels.h            -- GLM device helpers + kernel decls
- *   src/kernels/glm/<category>.hip       -- GLM kernel impls (included below)
- *   src/kernels/glm/glm_engine.hip       -- GLM host engine (glm_* entry points)
+ *   src/kernels/glm/<category>.hip       -- GLM kernel impls (included below):
+ *       elementwise, linear, quant, kvcache, gemm, moe, attention
+ *   src/kernels/glm/glm_{state,weights,forward,engine}.hip -- GLM host engine
  *   src/kernels/glm/unused_reference.hip -- retired kernels, NOT included/compiled
  * The only shared files are src/getp_run.hip (the model dispatcher) and
  * src/kernels/engines.h (the dispatch declarations); neither is model-specific.
  * ========================================================================== */
 #include "glm/elementwise.hip"
 #include "glm/linear.hip"
-#include "glm/rope.hip"
+#include "glm/quant.hip"
+#include "glm/kvcache.hip"
+#include "glm/gemm.hip"
+#include "glm/moe.hip"
 #include "glm/attention.hip"
-#include "glm/batched.hip"
 /* GLM host engine (glm_warm_up / glm_finish / glm_inference) -- shares this TU
  * with the kernels above so its launches resolve in-unit. */
+#include "glm/glm_state.hip"
+#include "glm/glm_weights.hip"
+#include "glm/glm_forward.hip"
 #include "glm/glm_engine.hip"
