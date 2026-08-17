@@ -160,10 +160,16 @@ __global__ void mfma_bf16_gemm_64x128(float *output,const uint16_t *input,
 
 __global__ void pack_head_bf16(uint16_t *output,const float *input,int batch,
     int heads,int input_stride,int cols){
-    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x,total=(size_t)batch*heads*cols;
-    if(i<total){int col=i%cols,head=(i/cols)%heads,token=i/(cols*heads);
-        output[((size_t)head*batch+token)*cols+col]=
-            to_bf16_rne(input[((size_t)token*heads+head)*input_stride+col]);}
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    int pairs=cols/2;size_t total=(size_t)batch*heads*pairs;
+    if(i<total){int pair=i%pairs,head=(i/pairs)%heads;
+        int token=i/(pairs*heads),col=pair*2;
+        const float2 v=*reinterpret_cast<const float2 *>(
+            input+((size_t)token*heads+head)*input_stride+col);
+        uint32_t packed=(uint32_t)to_bf16_rne(v.x)|
+                        ((uint32_t)to_bf16_rne(v.y)<<16);
+        *reinterpret_cast<uint32_t *>(
+            output+((size_t)head*batch+token)*cols+col)=packed;}
 }
 /* Per-head GEMM for MLA absorption/value projection.  Head-major packed input
  * reuses each weight tile across 64 tokens; output is restored token-major. */
@@ -1180,7 +1186,7 @@ extern "C" void dsv2_launch_batched_rope(float *q,int batch,int heads,int head_d
 extern "C" void dsv2_launch_prefill_cache(float *cache,const float *norm,const float *comp,int batch,int stride,int latent,int rope,const float *freq,hipStream_t s){
     prefill_cache_kernel<<<batch,BLOCK_SIZE,0,s>>>(cache,norm,comp,batch,stride,latent,rope,freq,batch,0,batch);}
 extern "C" void dsv2_launch_batched_absorb(float *out,const float *q,const uint16_t *w,int batch,int heads,int qhd,int nope,int value,int latent,hipStream_t s){
-    size_t total=(size_t)batch*heads*nope;
+    size_t total=(size_t)batch*heads*nope/2;
     pack_head_bf16<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(
         mfma_input,q,batch,heads,qhd,nope);
     grouped_head_mfma_32x64<<<dim3((latent+63)/64,(batch+63)/64,heads),512,0,s>>>(
@@ -1223,7 +1229,7 @@ extern "C" void dsv2_launch_decode_attention(float *ctx,const float *qa,
 extern "C" void dsv2_launch_batched_latent_value(float *out,const float *latent,const uint16_t *w,int batch,int heads,int nope,int value,int ld,hipStream_t s){
     int chunk_max=max(1,(int)(mfma_input_capacity/((size_t)heads*ld)));
     for(int start=0;start<batch;start+=chunk_max){int n=min(chunk_max,batch-start);
-        size_t total=(size_t)n*heads*ld;
+        size_t total=(size_t)n*heads*ld/2;
         pack_head_bf16<<<(total+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,s>>>(
             mfma_input,latent+(size_t)start*heads*ld,n,heads,ld,ld);
         grouped_head_mfma_32x64<<<dim3((value+63)/64,(n+63)/64,heads),512,0,s>>>(
