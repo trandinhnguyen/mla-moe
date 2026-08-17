@@ -63,6 +63,8 @@ void dsv2_launch_pack_expert_i8(int8_t *,float *,const float *,const int *,
     int,int,int,hipStream_t);
 void dsv2_launch_pack_sorted_bf16_i8(int8_t *,float *,const uint16_t *,int,int,
     hipStream_t);
+void dsv2_launch_quantize_rows_i8(int8_t *,float *,const float *,int,int,
+    hipStream_t);
 void dsv2_launch_grouped_expert_gate_up_i8(uint16_t *,const int8_t *,
     const float *,const int8_t *const *,const int8_t *const *,const float *,
     const float *,const int *,const int *,const int *,const int *,
@@ -74,6 +76,9 @@ void dsv2_launch_single_down_i8(float *,const int8_t *,const float *,
     const int8_t *,const float *,int,int,int,hipStream_t);
 void dsv2_launch_single_gate_up(uint16_t *,const uint16_t *,const uint16_t *,
     const uint16_t *,int,int,int,hipStream_t);
+void dsv2_launch_single_gate_up_i8(uint16_t *,const int8_t *,const float *,
+    const int8_t *,const int8_t *,const float *,const float *,int,int,int,
+    hipStream_t);
 void dsv2_launch_bf16_input_matvec(float *,const uint16_t *,const uint16_t *,
     int,int,int,hipStream_t);
 void dsv2_init_mfma_gemm(size_t);
@@ -126,6 +131,10 @@ struct DeviceLayer {
     uint16_t *q_proj = nullptr, *kv_a = nullptr, *kv_up = nullptr, *o_proj = nullptr;
     uint16_t *input_norm = nullptr, *post_norm = nullptr, *kv_norm = nullptr;
     uint16_t *dense_gate = nullptr, *dense_up = nullptr, *dense_down = nullptr;
+    int8_t *dense_gate_i8 = nullptr, *dense_up_i8 = nullptr,
+           *dense_down_i8 = nullptr;
+    float *dense_gate_scales = nullptr, *dense_up_scales = nullptr,
+          *dense_down_scales = nullptr;
     uint16_t *router = nullptr, *shared_gate = nullptr, *shared_up = nullptr,
              *shared_down = nullptr;
     uint16_t *expert_gate[DSV2_MAX_EXPERTS]{};
@@ -140,8 +149,10 @@ struct DeviceLayer {
     int8_t **expert_gate_i8_table = nullptr, **expert_up_i8_table = nullptr;
     float *expert_gate_scales = nullptr, *expert_up_scales = nullptr;
     int8_t *shared_down_i8 = nullptr;
+    int8_t *shared_gate_i8 = nullptr, *shared_up_i8 = nullptr;
     uint16_t **shared_down_table = nullptr;
-    float *shared_down_scales = nullptr;
+    float *shared_down_scales = nullptr, *shared_gate_scales = nullptr,
+          *shared_up_scales = nullptr;
 };
 
 struct DeviceModel {
@@ -317,8 +328,10 @@ void upload_model_weights(Transformer *t) {
         reinterpret_cast<const uint16_t *const *>(gpu_model.lm_head_table),
         gpu_model.lm_head_i8,gpu_model.lm_head_scales,1,c.vocab_size,H,0);
 
-    const size_t expert_elements=(size_t)c.moe_inter_size*H;
-    uint16_t *expert_staging=device_allocate<uint16_t>(expert_elements,
+    const size_t staging_elements=std::max({(size_t)c.moe_inter_size*H,
+                                            (size_t)SHARED*H,
+                                            (size_t)c.dense_inter_size*H});
+    uint16_t *expert_staging=device_allocate<uint16_t>(staging_elements,
                                                         "allocate expert staging");
     auto quantize_staged=[&](const uint16_t *host,int8_t *output,float *scales,
                              int rows,int cols){
@@ -332,6 +345,27 @@ void upload_model_weights(Transformer *t) {
             output,scales,1,rows,cols,0);
     };
 
+    for (int l = 0; l < c.first_k_dense; ++l) {
+        DeviceLayer &d=gpu_model.layer[l];
+        const size_t gu=(size_t)c.dense_inter_size*H;
+        d.dense_gate_i8=device_allocate<int8_t>(gu,"allocate INT8 dense gate");
+        d.dense_up_i8=device_allocate<int8_t>(gu,"allocate INT8 dense up");
+        d.dense_down_i8=device_allocate<int8_t>((size_t)H*c.dense_inter_size,
+                                                "allocate INT8 dense down");
+        d.dense_gate_scales=device_allocate<float>(c.dense_inter_size,
+                                                   "allocate dense gate scales");
+        d.dense_up_scales=device_allocate<float>(c.dense_inter_size,
+                                                 "allocate dense up scales");
+        d.dense_down_scales=device_allocate<float>(H,
+                                                   "allocate dense down scales");
+        quantize_staged(w.dense_gate[l],d.dense_gate_i8,d.dense_gate_scales,
+                        c.dense_inter_size,H);
+        quantize_staged(w.dense_up[l],d.dense_up_i8,d.dense_up_scales,
+                        c.dense_inter_size,H);
+        quantize_staged(w.dense_down[l],d.dense_down_i8,d.dense_down_scales,
+                        H,c.dense_inter_size);
+    }
+
     for (int l = c.first_k_dense; l < c.n_layers; ++l) {
         DeviceLayer &d = gpu_model.layer[l];
         size_t shared_down_elements=(size_t)H*SHARED;
@@ -339,6 +373,14 @@ void upload_model_weights(Transformer *t) {
                                                   "allocate INT8 shared down");
         d.shared_down_scales=device_allocate<float>(H,
                                                      "allocate shared down scales");
+        d.shared_gate_i8=device_allocate<int8_t>((size_t)SHARED*H,
+                                                 "allocate INT8 shared gate");
+        d.shared_up_i8=device_allocate<int8_t>((size_t)SHARED*H,
+                                               "allocate INT8 shared up");
+        d.shared_gate_scales=device_allocate<float>(SHARED,
+                                                    "allocate shared gate scales");
+        d.shared_up_scales=device_allocate<float>(SHARED,
+                                                  "allocate shared up scales");
         d.shared_down_table=device_allocate<uint16_t *>(1,
                                                         "allocate shared down table");
         hip_check(hipMemcpy(d.shared_down_table,&d.shared_down,sizeof(d.shared_down),
@@ -346,6 +388,10 @@ void upload_model_weights(Transformer *t) {
         dsv2_quantize_expert_down(
             reinterpret_cast<const uint16_t *const *>(d.shared_down_table),
             d.shared_down_i8,d.shared_down_scales,1,H,SHARED,0);
+        quantize_staged(w.shared_gate[l],d.shared_gate_i8,d.shared_gate_scales,
+                        SHARED,H);
+        quantize_staged(w.shared_up[l],d.shared_up_i8,d.shared_up_scales,
+                        SHARED,H);
         size_t down_elements=(size_t)c.n_routed_experts*H*c.moe_inter_size;
         d.expert_down_i8=device_allocate<int8_t>(down_elements,
                                                  "allocate INT8 expert down");
@@ -451,8 +497,8 @@ void allocate_device_state(Transformer *t) {
                                                    "allocate expert tile starts");
     gpu_state.expert_i8=device_allocate<int8_t>(max_chunk_routes*H,"allocate packed expert INT8");
     gpu_state.expert_i8_scales=device_allocate<float>(max_chunk_routes,"allocate expert scales");
-    gpu_state.shared_i8=device_allocate<int8_t>((size_t)MOE_CHUNK_TOKENS*SHARED,
-                                                 "allocate shared down INT8 input");
+    gpu_state.shared_i8=device_allocate<int8_t>((size_t)MOE_CHUNK_TOKENS*HB,
+                                                 "allocate dense/shared INT8 input");
     gpu_state.shared_i8_scales=device_allocate<float>(MOE_CHUNK_TOKENS,
                                                        "allocate shared down scales");
     hip_check(hipMemcpy(gpu_state.inverse_frequency, t->rope_inv_freq,
@@ -533,6 +579,26 @@ void gpu_swiglu_batch(float *output, const float *input,
     }
 }
 
+void gpu_swiglu_batch_i8(float *output,const float *input,DeviceLayer &w,
+                         int batch,int intermediate,int hidden){
+    for(int start=0;start<batch;start+=MOE_CHUNK_TOKENS){
+        int n=std::min(MOE_CHUNK_TOKENS,batch-start);
+        const float *x=input+(size_t)start*hidden;
+        dsv2_launch_quantize_rows_i8(gpu_state.shared_i8,
+            gpu_state.shared_i8_scales,x,n,hidden,0);
+        dsv2_launch_single_gate_up_i8(gpu_state.dense_fused_gate,
+            gpu_state.shared_i8,gpu_state.shared_i8_scales,w.dense_gate_i8,
+            w.dense_up_i8,w.dense_gate_scales,w.dense_up_scales,n,
+            intermediate,hidden,0);
+        dsv2_launch_pack_sorted_bf16_i8(gpu_state.shared_i8,
+            gpu_state.shared_i8_scales,gpu_state.dense_fused_gate,n,
+            intermediate,0);
+        dsv2_launch_single_down_i8(output+(size_t)start*hidden,
+            gpu_state.shared_i8,gpu_state.shared_i8_scales,w.dense_down_i8,
+            w.dense_down_scales,n,hidden,intermediate,0);
+    }
+}
+
 void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
                    float *output,int batch){
     const int H=c.hidden_size,K=MOE_ACTIVE_TOP_K;
@@ -542,8 +608,12 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
     hip_check(hipStreamWaitEvent(shared_expert_stream,moe_input_ready,0),
               "wait for MoE input on shared stream");
     auto *shared_bf16=gpu_state.dense_fused_gate;
-    dsv2_launch_single_gate_up(shared_bf16,nullptr,w.shared_gate,w.shared_up,
-                              batch,SHARED,H,shared_expert_stream);
+    dsv2_launch_quantize_rows_i8(gpu_state.shared_i8,
+        gpu_state.shared_i8_scales,input,batch,H,shared_expert_stream);
+    dsv2_launch_single_gate_up_i8(shared_bf16,gpu_state.shared_i8,
+        gpu_state.shared_i8_scales,w.shared_gate_i8,w.shared_up_i8,
+        w.shared_gate_scales,w.shared_up_scales,batch,SHARED,H,
+        shared_expert_stream);
     dsv2_launch_pack_sorted_bf16_i8(gpu_state.shared_i8,
         gpu_state.shared_i8_scales,shared_bf16,batch,SHARED,
         shared_expert_stream);
@@ -628,7 +698,8 @@ void gpu_prefill_group(Transformer *t, const int *tokens, int requests,
         dsv2_launch_batched_matvec(gpu_state.pbranch,gpu_state.pcontext,w.o_proj,batch,H,NH*VHD,0);
         dsv2_launch_batched_residual_rmsnorm(gpu_state.px,gpu_state.pxb,
             gpu_state.pbranch,w.post_norm,batch,H,c.rms_eps,0);
-        if(l<c.first_k_dense){gpu_swiglu_batch(gpu_state.pmlp,gpu_state.pxb,w.dense_gate,w.dense_up,w.dense_down,batch,c.dense_inter_size,H);}
+        if(l<c.first_k_dense){gpu_swiglu_batch_i8(gpu_state.pmlp,gpu_state.pxb,
+            w,batch,c.dense_inter_size,H);}
         else for(int start=0;start<batch;start+=MOE_CHUNK_TOKENS){
             int n=std::min(MOE_CHUNK_TOKENS,batch-start);
             gpu_moe_chunk(c,w,gpu_state.pxb+(size_t)start*H,
@@ -692,8 +763,8 @@ void gpu_decode_batch(Transformer *t,const int *tokens,const int *positions,
                                    batch,H,NH*VHD,0);
         dsv2_launch_batched_residual_rmsnorm(gpu_state.px,gpu_state.pxb,
             gpu_state.pbranch,w.post_norm,batch,H,c.rms_eps,0);
-        if(l<c.first_k_dense)gpu_swiglu_batch(gpu_state.pmlp,gpu_state.pxb,
-            w.dense_gate,w.dense_up,w.dense_down,batch,c.dense_inter_size,H);
+        if(l<c.first_k_dense)gpu_swiglu_batch_i8(gpu_state.pmlp,gpu_state.pxb,
+            w,batch,c.dense_inter_size,H);
         else gpu_moe_chunk(c,w,gpu_state.pxb,gpu_state.pmlp,batch);
         dsv2_launch_batched_residual(gpu_state.px,gpu_state.pmlp,batch*H,0);
     }

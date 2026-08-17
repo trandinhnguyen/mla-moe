@@ -954,14 +954,19 @@ __global__ void grouped_expert_gate_up_i8_64x128(uint16_t *gate,
     const int8_t *const *gate_w,const int8_t *const *up_w,
     const float *gate_scales,const float *up_scales,const int *counts,
     const int *offsets,const int *tile_experts,const int *tile_starts,
-    int rows,int cols){
-    int expert=tile_experts[blockIdx.y];if(expert<0)return;
-    int count=counts[expert],offset=offsets[expert];
+    int rows,int cols,int single_count){
+    int expert=single_count>=0?0:tile_experts[blockIdx.y];if(expert<0)return;
+    int count=single_count>=0?single_count:counts[expert];
+    int offset=single_count>=0?0:offsets[expert];
     int tid=threadIdx.x,lane=tid&63,wave=tid>>6,mt=wave&1,nt=wave>>1;
-    int tile_m=blockIdx.x*64,tile_n=tile_starts[blockIdx.y],kg=(lane>>4)*4;
+    int tile_m=blockIdx.x*64,tile_n=single_count>=0?blockIdx.y*128:
+        tile_starts[blockIdx.y],kg=(lane>>4)*4;
     int4_acc ag0={0,0,0,0},au0={0,0,0,0},ag1={0,0,0,0},au1={0,0,0,0};
     int4_acc bg0={0,0,0,0},bu0={0,0,0,0},bg1={0,0,0,0},bu1={0,0,0,0};
-    const int8_t *wg=gate_w[expert],*wu=up_w[expert];
+    const int8_t *wg=single_count>=0?reinterpret_cast<const int8_t *>(gate_w):
+        gate_w[expert];
+    const int8_t *wu=single_count>=0?reinterpret_cast<const int8_t *>(up_w):
+        up_w[expert];
     const int8_t *x=input+(size_t)offset*cols;
     __shared__ int8_t gs[2][2048],us[2][2048],bs[2][4096];
     {int z=tid*4,r=z/32,k=z%32;uint32_t gv=0,uv=0;
@@ -1235,6 +1240,10 @@ extern "C" void dsv2_launch_pack_sorted_bf16_i8(int8_t *out,float *scales,
     const uint16_t *in,int routes,int hidden,hipStream_t s){
     pack_sorted_bf16_i8_kernel<<<routes,256,0,s>>>(out,scales,in,routes,hidden);
 }
+extern "C" void dsv2_launch_quantize_rows_i8(int8_t *out,float *scales,
+    const float *in,int rows,int cols,hipStream_t s){
+    quantize_rows_i8_kernel<<<rows,256,0,s>>>(out,scales,in,rows,cols);
+}
 extern "C" void dsv2_quantize_expert_down(const uint16_t *const *input,
     int8_t *output,float *scales,int experts,int rows,int cols,hipStream_t s){
     quantize_expert_down_kernel<<<dim3(rows,experts),256,0,s>>>(
@@ -1264,7 +1273,16 @@ extern "C" void dsv2_launch_grouped_expert_gate_up_i8(uint16_t *gate,
     const int *tile_starts,int max_tiles,int rows,int cols,hipStream_t s){
     grouped_expert_gate_up_i8_64x128<<<dim3((rows+63)/64,max_tiles),512,0,s>>>(
         gate,in,input_scales,gate_w,up_w,gate_scales,up_scales,counts,offsets,
-        tile_experts,tile_starts,rows,cols);
+        tile_experts,tile_starts,rows,cols,-1);
+}
+extern "C" void dsv2_launch_single_gate_up_i8(uint16_t *gate,const int8_t *in,
+    const float *input_scales,const int8_t *gate_w,const int8_t *up_w,
+    const float *gate_scales,const float *up_scales,int batch,int rows,int cols,
+    hipStream_t s){
+    grouped_expert_gate_up_i8_64x128<<<dim3((rows+63)/64,(batch+127)/128),512,0,s>>>(
+        gate,in,input_scales,reinterpret_cast<const int8_t *const *>(gate_w),
+        reinterpret_cast<const int8_t *const *>(up_w),gate_scales,up_scales,
+        nullptr,nullptr,nullptr,nullptr,rows,cols,batch);
 }
 extern "C" void dsv2_launch_single_gate_up(uint16_t *gate,const uint16_t *in,
     const uint16_t *gate_w,const uint16_t *up_w,int batch,int rows,int cols,
