@@ -124,11 +124,13 @@ int8_t *device_lm_input_i8 = nullptr;
 float *device_lm_input_scales = nullptr;
 hipStream_t shared_expert_stream = nullptr;
 hipEvent_t moe_input_ready = nullptr, shared_expert_done = nullptr;
-hipEvent_t projection_input_ready = nullptr, projection_done = nullptr;
 bool backend_initialized = false;
 
 struct DeviceLayer {
     uint16_t *q_proj = nullptr, *kv_a = nullptr, *kv_up = nullptr, *o_proj = nullptr;
+    int8_t *q_proj_i8 = nullptr, *kv_a_i8 = nullptr, *o_proj_i8 = nullptr;
+    float *q_proj_scales = nullptr, *kv_a_scales = nullptr,
+          *o_proj_scales = nullptr;
     uint16_t *input_norm = nullptr, *post_norm = nullptr, *kv_norm = nullptr;
     uint16_t *dense_gate = nullptr, *dense_up = nullptr, *dense_down = nullptr;
     int8_t *dense_gate_i8 = nullptr, *dense_up_i8 = nullptr,
@@ -185,6 +187,8 @@ struct DeviceState {
     float *expert_i8_scales = nullptr;
     int8_t *shared_i8 = nullptr;
     float *shared_i8_scales = nullptr;
+    int8_t *projection_i8 = nullptr;
+    float *projection_i8_scales = nullptr;
 };
 
 DeviceModel gpu_model;
@@ -366,6 +370,22 @@ void upload_model_weights(Transformer *t) {
                         H,c.dense_inter_size);
     }
 
+    for(int l=0;l<c.n_layers;++l){
+        DeviceLayer &d=gpu_model.layer[l];
+        d.q_proj_i8=device_allocate<int8_t>((size_t)QD*H,
+                                            "allocate INT8 Q projection");
+        d.q_proj_scales=device_allocate<float>(QD,"allocate Q projection scales");
+        d.kv_a_i8=device_allocate<int8_t>((size_t)KVD*H,
+                                          "allocate INT8 KV projection");
+        d.kv_a_scales=device_allocate<float>(KVD,"allocate KV projection scales");
+        d.o_proj_i8=device_allocate<int8_t>((size_t)H*H,
+                                            "allocate INT8 O projection");
+        d.o_proj_scales=device_allocate<float>(H,"allocate O projection scales");
+        quantize_staged(w.q_proj[l],d.q_proj_i8,d.q_proj_scales,QD,H);
+        quantize_staged(w.kv_a_proj[l],d.kv_a_i8,d.kv_a_scales,KVD,H);
+        quantize_staged(w.o_proj[l],d.o_proj_i8,d.o_proj_scales,H,H);
+    }
+
     for (int l = c.first_k_dense; l < c.n_layers; ++l) {
         DeviceLayer &d = gpu_model.layer[l];
         size_t shared_down_elements=(size_t)H*SHARED;
@@ -501,6 +521,10 @@ void allocate_device_state(Transformer *t) {
                                                  "allocate dense/shared INT8 input");
     gpu_state.shared_i8_scales=device_allocate<float>(MOE_CHUNK_TOKENS,
                                                        "allocate shared down scales");
+    gpu_state.projection_i8=device_allocate<int8_t>(B*H,
+                                                     "allocate INT8 projection input");
+    gpu_state.projection_i8_scales=device_allocate<float>(B,
+                                                    "allocate projection scales");
     hip_check(hipMemcpy(gpu_state.inverse_frequency, t->rope_inv_freq,
                         (size_t)c.qk_rope_head_dim / 2 * sizeof(float),
                         hipMemcpyHostToDevice), "upload rope frequency");
@@ -672,16 +696,14 @@ void gpu_prefill_group(Transformer *t, const int *tokens, int requests,
     for(int l=0;l<c.n_layers;++l){
         DeviceLayer &w=gpu_model.layer[l];float *cache=gpu_state.kv_cache+(size_t)l*layer_cache;
         dsv2_launch_batched_rmsnorm(gpu_state.pxb,gpu_state.px,w.input_norm,batch,H,c.rms_eps,0);
-        dsv2_prepare_batched_bf16(gpu_state.pxb,batch,H,0);
-        hip_check(hipEventRecord(projection_input_ready,0),"record projection input");
-        hip_check(hipStreamWaitEvent(shared_expert_stream,projection_input_ready,0),
-                  "wait for projection input");
-        dsv2_launch_prepared_matvec(gpu_state.pcomp,w.kv_a,batch,KVD,H,
-                                    shared_expert_stream);
-        dsv2_launch_prepared_matvec(gpu_state.pq,w.q_proj,batch,QD,H,0);
-        hip_check(hipEventRecord(projection_done,shared_expert_stream),
-                  "record KV projection");
-        hip_check(hipStreamWaitEvent(0,projection_done,0),"join KV projection");
+        dsv2_launch_quantize_rows_i8(gpu_state.projection_i8,
+            gpu_state.projection_i8_scales,gpu_state.pxb,batch,H,0);
+        dsv2_launch_single_down_i8(gpu_state.pq,gpu_state.projection_i8,
+            gpu_state.projection_i8_scales,w.q_proj_i8,w.q_proj_scales,
+            batch,QD,H,0);
+        dsv2_launch_single_down_i8(gpu_state.pcomp,gpu_state.projection_i8,
+            gpu_state.projection_i8_scales,w.kv_a_i8,w.kv_a_scales,
+            batch,KVD,H,0);
         dsv2_launch_group_rope(gpu_state.pq,batch,NH,QHD,QKN,QKR,
                                gpu_state.inverse_frequency,sequence_length,0);
         dsv2_launch_batched_rmsnorm_strided(gpu_state.pkvnorm,KVL,gpu_state.pcomp,
@@ -695,7 +717,11 @@ void gpu_prefill_group(Transformer *t, const int *tokens, int requests,
             expanded_value,gpu_state.pq,gpu_state.pkvnorm,cache,w.kv_up,batch,NH,
             QHD,QKN,VHD,KVL,sequence_length,request_base,CACHE_SEQUENCE,
             c.softmax_scale,0);
-        dsv2_launch_batched_matvec(gpu_state.pbranch,gpu_state.pcontext,w.o_proj,batch,H,NH*VHD,0);
+        dsv2_launch_quantize_rows_i8(gpu_state.projection_i8,
+            gpu_state.projection_i8_scales,gpu_state.pcontext,batch,NH*VHD,0);
+        dsv2_launch_single_down_i8(gpu_state.pbranch,gpu_state.projection_i8,
+            gpu_state.projection_i8_scales,w.o_proj_i8,w.o_proj_scales,
+            batch,H,NH*VHD,0);
         dsv2_launch_batched_residual_rmsnorm(gpu_state.px,gpu_state.pxb,
             gpu_state.pbranch,w.post_norm,batch,H,c.rms_eps,0);
         if(l<c.first_k_dense){gpu_swiglu_batch_i8(gpu_state.pmlp,gpu_state.pxb,
@@ -735,16 +761,14 @@ void gpu_decode_batch(Transformer *t,const int *tokens,const int *positions,
     for(int l=0;l<c.n_layers;++l){DeviceLayer &w=gpu_model.layer[l];
         float *cache=gpu_state.kv_cache+(size_t)l*layer_cache;
         dsv2_launch_batched_rmsnorm(gpu_state.pxb,gpu_state.px,w.input_norm,batch,H,c.rms_eps,0);
-        dsv2_prepare_batched_bf16(gpu_state.pxb,batch,H,0);
-        hip_check(hipEventRecord(projection_input_ready,0),"record projection input");
-        hip_check(hipStreamWaitEvent(shared_expert_stream,projection_input_ready,0),
-                  "wait for projection input");
-        dsv2_launch_prepared_matvec(gpu_state.pcomp,w.kv_a,batch,KVD,H,
-                                    shared_expert_stream);
-        dsv2_launch_prepared_matvec(gpu_state.pq,w.q_proj,batch,QD,H,0);
-        hip_check(hipEventRecord(projection_done,shared_expert_stream),
-                  "record KV projection");
-        hip_check(hipStreamWaitEvent(0,projection_done,0),"join KV projection");
+        dsv2_launch_quantize_rows_i8(gpu_state.projection_i8,
+            gpu_state.projection_i8_scales,gpu_state.pxb,batch,H,0);
+        dsv2_launch_single_down_i8(gpu_state.pq,gpu_state.projection_i8,
+            gpu_state.projection_i8_scales,w.q_proj_i8,w.q_proj_scales,
+            batch,QD,H,0);
+        dsv2_launch_single_down_i8(gpu_state.pcomp,gpu_state.projection_i8,
+            gpu_state.projection_i8_scales,w.kv_a_i8,w.kv_a_scales,
+            batch,KVD,H,0);
         dsv2_launch_decode_rope(gpu_state.pq,batch,NH,QHD,QKN,QKR,
                                 gpu_state.inverse_frequency,gpu_state.positions,0);
         dsv2_launch_batched_rmsnorm_strided(gpu_state.pkvnorm,KVL,gpu_state.pcomp,
@@ -759,8 +783,11 @@ void gpu_decode_batch(Transformer *t,const int *tokens,const int *positions,
             gpu_state.positions,CACHE_SEQUENCE,0);
         dsv2_launch_batched_latent_value(gpu_state.pcontext,gpu_state.platent,
                                          w.kv_up,batch,NH,QKN,VHD,KVL,0);
-        dsv2_launch_batched_matvec(gpu_state.pbranch,gpu_state.pcontext,w.o_proj,
-                                   batch,H,NH*VHD,0);
+        dsv2_launch_quantize_rows_i8(gpu_state.projection_i8,
+            gpu_state.projection_i8_scales,gpu_state.pcontext,batch,NH*VHD,0);
+        dsv2_launch_single_down_i8(gpu_state.pbranch,gpu_state.projection_i8,
+            gpu_state.projection_i8_scales,w.o_proj_i8,w.o_proj_scales,
+            batch,H,NH*VHD,0);
         dsv2_launch_batched_residual_rmsnorm(gpu_state.px,gpu_state.pxb,
             gpu_state.pbranch,w.post_norm,batch,H,c.rms_eps,0);
         if(l<c.first_k_dense)gpu_swiglu_batch_i8(gpu_state.pmlp,gpu_state.pxb,
@@ -792,10 +819,6 @@ void warm_up(Transformer *t) {
               "create MoE input event");
     hip_check(hipEventCreateWithFlags(&shared_expert_done,hipEventDisableTiming),
               "create shared expert event");
-    hip_check(hipEventCreateWithFlags(&projection_input_ready,hipEventDisableTiming),
-              "create projection input event");
-    hip_check(hipEventCreateWithFlags(&projection_done,hipEventDisableTiming),
-              "create projection event");
     const Config &warm_config=t->config;
     dsv2_init_mfma_gemm((size_t)PREFILL_CAPACITY*warm_config.hidden_size);
     size_t lm_partials=(size_t)MAX_REQUESTS*((t->config.vocab_size+63)/64);
@@ -822,10 +845,7 @@ void finish(Transformer *t) {
     if(!backend_initialized)return;
     hip_check(hipEventDestroy(shared_expert_done),"destroy shared expert event");
     hip_check(hipEventDestroy(moe_input_ready),"destroy MoE input event");
-    hip_check(hipEventDestroy(projection_done),"destroy projection event");
-    hip_check(hipEventDestroy(projection_input_ready),"destroy projection input event");
     hip_check(hipStreamDestroy(shared_expert_stream),"destroy shared expert stream");
-    projection_done=nullptr;projection_input_ready=nullptr;
     shared_expert_done=nullptr;moe_input_ready=nullptr;shared_expert_stream=nullptr;
     dsv2_finish_mfma_gemm();
     hip_check(hipFree(device_lm_input_scales),"free LM input scales");
