@@ -804,6 +804,56 @@ __global__ void grouped_expert_down_i8_native(float *output,const int8_t *input,
             (float)b1[i]*xs1*weight_scales[(size_t)expert*rows+r1+i];}
 }
 
+/* Decode routes average only 32 rows/expert at top-4.  A true 64-route tile
+ * avoids the second activation half and four unused accumulator vectors of the
+ * 128-route prefill kernel without imposing a lossy expert capacity. */
+__global__ void grouped_expert_down_i8_64(float *output,const int8_t *input,
+    const float *input_scales,const int8_t *const *weights,
+    const float *weight_scales,const int *counts,const int *slots,
+    const int *offsets,const int *tile_experts,const int *tile_starts,
+    int rows,int cols){
+    int descriptor=blockIdx.y,expert=tile_experts[descriptor];if(expert<0)return;
+    int count=counts[expert],offset=offsets[expert];
+    int tid=threadIdx.x,lane=tid&63,wave=tid>>6,mt=wave&1,nt=wave>>1;
+    int tile_m=blockIdx.x*64,tile_n=tile_starts[descriptor],kg=(lane>>4)*4;
+    int4_acc a0={0,0,0,0},a1={0,0,0,0};
+    const int8_t *w=weights[expert],*x=input+(size_t)offset*cols;
+    __shared__ int8_t as[2][2048],bs[2][2048];
+    {int z=tid*4,r=z/32,k=z%32;uint32_t av=0,bv=0;
+        if(tile_m+r<rows)av=*reinterpret_cast<const uint32_t *>(w+(size_t)(tile_m+r)*cols+k);
+        if(tile_n+r<count)bv=*reinterpret_cast<const uint32_t *>(x+(size_t)(tile_n+r)*cols+k);
+        *reinterpret_cast<uint32_t *>(as[0]+z)=av;
+        *reinterpret_cast<uint32_t *>(bs[0]+z)=bv;}
+    __syncthreads();
+    for(int kb=0;kb<cols;kb+=32){int cur=(kb>>5)&1,nxt=cur^1;
+        uint32_t nav=0,nbv=0;
+        if(kb+32<cols){int z=tid*4,r=z/32,k=z%32;
+            if(tile_m+r<rows)nav=*reinterpret_cast<const uint32_t *>(w+(size_t)(tile_m+r)*cols+kb+32+k);
+            if(tile_n+r<count)nbv=*reinterpret_cast<const uint32_t *>(x+(size_t)(tile_n+r)*cols+kb+32+k);}
+        #pragma unroll
+        for(int sk=0;sk<32;sk+=16){
+            int ai0=(mt*16+(lane&15))*32+sk+kg,ai1=ai0+32*32;
+            int bi=(nt*16+(lane&15))*32+sk+kg;
+            int av0=*reinterpret_cast<int *>(as[cur]+ai0);
+            int av1=*reinterpret_cast<int *>(as[cur]+ai1);
+            int bv=*reinterpret_cast<int *>(bs[cur]+bi);
+            a0=__builtin_amdgcn_mfma_i32_16x16x16i8(av0,bv,a0,0,0,0);
+            a1=__builtin_amdgcn_mfma_i32_16x16x16i8(av1,bv,a1,0,0,0);}
+        if(kb+32<cols){int z=tid*4;
+            *reinterpret_cast<uint32_t *>(as[nxt]+z)=nav;
+            *reinterpret_cast<uint32_t *>(bs[nxt]+z)=nbv;}
+        __syncthreads();}
+    int r0=tile_m+mt*16+(lane>>4)*4,r1=r0+32;
+    int n=tile_n+nt*16+(lane&15),route=n<count?slots[offset+n]:0;
+    float xs=n<count?input_scales[offset+n]:0.0f;
+    #pragma unroll
+    for(int i=0;i<4;++i){
+        if(n<count&&r0+i<rows)output[(size_t)route*rows+r0+i]=
+            (float)a0[i]*xs*weight_scales[(size_t)expert*rows+r0+i];
+        if(n<count&&r1+i<rows)output[(size_t)route*rows+r1+i]=
+            (float)a1[i]*xs*weight_scales[(size_t)expert*rows+r1+i];}
+}
+
 __global__ void lm_argmax_i8_kernel(float *partial_value,int *partial_index,
     const int8_t *input,const float *input_scales,const int8_t *weight,
     const float *weight_scales,int batch,int vocab,int cols,int tiles){
@@ -1070,6 +1120,62 @@ __global__ void grouped_expert_gate_up_i8_64x128(uint16_t *gate,
             gate[((size_t)offset+n1)*rows+r1+i]=to_bf16_rne((g/(1.0f+__expf(-g)))*u);}}
 }
 
+__global__ void grouped_expert_gate_up_i8_64(uint16_t *gate,
+    const int8_t *input,const float *input_scales,
+    const int8_t *const *gate_w,const int8_t *const *up_w,
+    const float *gate_scales,const float *up_scales,const int *counts,
+    const int *offsets,const int *tile_experts,const int *tile_starts,
+    int rows,int cols){
+    int expert=tile_experts[blockIdx.y];if(expert<0)return;
+    int count=counts[expert],offset=offsets[expert];
+    int tid=threadIdx.x,lane=tid&63,wave=tid>>6,mt=wave&1,nt=wave>>1;
+    int tile_m=blockIdx.x*64,tile_n=tile_starts[blockIdx.y],kg=(lane>>4)*4;
+    int4_acc ag0={0,0,0,0},au0={0,0,0,0},ag1={0,0,0,0},au1={0,0,0,0};
+    const int8_t *wg=gate_w[expert],*wu=up_w[expert];
+    const int8_t *x=input+(size_t)offset*cols;
+    __shared__ int8_t gs[2][2048],us[2][2048],bs[2][2048];
+    {int z=tid*4,r=z/32,k=z%32;uint32_t gv=0,uv=0,bv=0;
+        if(tile_m+r<rows){gv=*reinterpret_cast<const uint32_t *>(wg+(size_t)(tile_m+r)*cols+k);
+            uv=*reinterpret_cast<const uint32_t *>(wu+(size_t)(tile_m+r)*cols+k);}
+        if(tile_n+r<count)bv=*reinterpret_cast<const uint32_t *>(x+(size_t)(tile_n+r)*cols+k);
+        *reinterpret_cast<uint32_t *>(gs[0]+z)=gv;
+        *reinterpret_cast<uint32_t *>(us[0]+z)=uv;
+        *reinterpret_cast<uint32_t *>(bs[0]+z)=bv;}
+    __syncthreads();
+    for(int kb=0;kb<cols;kb+=32){int cur=(kb>>5)&1,nxt=cur^1;
+        uint32_t ng=0,nu=0,nb=0;
+        if(kb+32<cols){int z=tid*4,r=z/32,k=z%32;
+            if(tile_m+r<rows){ng=*reinterpret_cast<const uint32_t *>(wg+(size_t)(tile_m+r)*cols+kb+32+k);
+                nu=*reinterpret_cast<const uint32_t *>(wu+(size_t)(tile_m+r)*cols+kb+32+k);}
+            if(tile_n+r<count)nb=*reinterpret_cast<const uint32_t *>(x+(size_t)(tile_n+r)*cols+kb+32+k);}
+        #pragma unroll
+        for(int sk=0;sk<32;sk+=16){
+            int ai0=(mt*16+(lane&15))*32+sk+kg,ai1=ai0+32*32;
+            int bi=(nt*16+(lane&15))*32+sk+kg;
+            int av0=*reinterpret_cast<int *>(gs[cur]+ai0),av1=*reinterpret_cast<int *>(gs[cur]+ai1);
+            int uv0=*reinterpret_cast<int *>(us[cur]+ai0),uv1=*reinterpret_cast<int *>(us[cur]+ai1);
+            int bv=*reinterpret_cast<int *>(bs[cur]+bi);
+            ag0=__builtin_amdgcn_mfma_i32_16x16x16i8(av0,bv,ag0,0,0,0);
+            au0=__builtin_amdgcn_mfma_i32_16x16x16i8(uv0,bv,au0,0,0,0);
+            ag1=__builtin_amdgcn_mfma_i32_16x16x16i8(av1,bv,ag1,0,0,0);
+            au1=__builtin_amdgcn_mfma_i32_16x16x16i8(uv1,bv,au1,0,0,0);}
+        if(kb+32<cols){int z=tid*4;
+            *reinterpret_cast<uint32_t *>(gs[nxt]+z)=ng;
+            *reinterpret_cast<uint32_t *>(us[nxt]+z)=nu;
+            *reinterpret_cast<uint32_t *>(bs[nxt]+z)=nb;}
+        __syncthreads();}
+    int r0=tile_m+mt*16+(lane>>4)*4,r1=r0+32;
+    int n=tile_n+nt*16+(lane&15);float is=n<count?input_scales[offset+n]:0.0f;
+    #pragma unroll
+    for(int i=0;i<4;++i){
+        if(n<count&&r0+i<rows){float g=(float)ag0[i]*is*gate_scales[(size_t)expert*rows+r0+i];
+            float u=(float)au0[i]*is*up_scales[(size_t)expert*rows+r0+i];
+            gate[((size_t)offset+n)*rows+r0+i]=to_bf16_rne((g/(1.0f+__expf(-g)))*u);}
+        if(n<count&&r1+i<rows){float g=(float)ag1[i]*is*gate_scales[(size_t)expert*rows+r1+i];
+            float u=(float)au1[i]*is*up_scales[(size_t)expert*rows+r1+i];
+            gate[((size_t)offset+n)*rows+r1+i]=to_bf16_rne((g/(1.0f+__expf(-g)))*u);}}
+}
+
 __global__ void batched_weighted_add_kernel(float *output,const float *experts,
                                             const float *weights,int batch,
                                             int topk,int hidden){
@@ -1305,6 +1411,16 @@ extern "C" void dsv2_launch_grouped_expert_down_i8_native(float *out,
         out,in,input_scales,weights,weight_scales,counts,slots,offsets,
         tile_experts,tile_starts,rows,cols,0);
 }
+extern "C" void dsv2_launch_grouped_expert_down_i8_native_64(float *out,
+    const int8_t *in,const float *input_scales,
+    const int8_t *const *weights,const float *weight_scales,
+    const int *counts,const int *slots,const int *offsets,
+    const int *tile_experts,const int *tile_starts,int max_tiles,
+    int rows,int cols,hipStream_t s){
+    grouped_expert_down_i8_64<<<dim3((rows+63)/64,max_tiles),512,0,s>>>(
+        out,in,input_scales,weights,weight_scales,counts,slots,offsets,
+        tile_experts,tile_starts,rows,cols);
+}
 extern "C" void dsv2_launch_single_down_i8(float *out,const int8_t *in,
     const float *input_scales,const int8_t *weights,const float *weight_scales,
     int batch,int rows,int cols,hipStream_t s){
@@ -1320,6 +1436,15 @@ extern "C" void dsv2_launch_grouped_expert_gate_up_i8(uint16_t *gate,
     grouped_expert_gate_up_i8_64x128<<<dim3((rows+63)/64,max_tiles),512,0,s>>>(
         gate,in,input_scales,gate_w,up_w,gate_scales,up_scales,counts,offsets,
         tile_experts,tile_starts,rows,cols,-1);
+}
+extern "C" void dsv2_launch_grouped_expert_gate_up_i8_64(uint16_t *gate,
+    const int8_t *in,const float *input_scales,const int8_t *const *gate_w,
+    const int8_t *const *up_w,const float *gate_scales,const float *up_scales,
+    const int *counts,const int *offsets,const int *tile_experts,
+    const int *tile_starts,int max_tiles,int rows,int cols,hipStream_t s){
+    grouped_expert_gate_up_i8_64<<<dim3((rows+63)/64,max_tiles),512,0,s>>>(
+        gate,in,input_scales,gate_w,up_w,gate_scales,up_scales,counts,offsets,
+        tile_experts,tile_starts,rows,cols);
 }
 extern "C" void dsv2_launch_single_gate_up_i8(uint16_t *gate,const int8_t *in,
     const float *input_scales,const int8_t *gate_w,const int8_t *up_w,

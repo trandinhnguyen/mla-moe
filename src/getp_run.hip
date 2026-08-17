@@ -69,7 +69,14 @@ void dsv2_launch_grouped_expert_gate_up_i8(uint16_t *,const int8_t *,
     const float *,const int8_t *const *,const int8_t *const *,const float *,
     const float *,const int *,const int *,const int *,const int *,
     int,int,int,hipStream_t);
+void dsv2_launch_grouped_expert_gate_up_i8_64(uint16_t *,const int8_t *,
+    const float *,const int8_t *const *,const int8_t *const *,const float *,
+    const float *,const int *,const int *,const int *,const int *,
+    int,int,int,hipStream_t);
 void dsv2_launch_grouped_expert_down_i8_native(float *,const int8_t *,
+    const float *,const int8_t *const *,const float *,const int *,const int *,
+    const int *,const int *,const int *,int,int,int,hipStream_t);
+void dsv2_launch_grouped_expert_down_i8_native_64(float *,const int8_t *,
     const float *,const int8_t *const *,const float *,const int *,const int *,
     const int *,const int *,const int *,int,int,int,hipStream_t);
 void dsv2_launch_single_down_i8(float *,const int8_t *,const float *,
@@ -635,7 +642,8 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
         c.n_routed_experts,H,0);
     dsv2_launch_batched_router_topk(gpu_state.prouter,batch,c.n_routed_experts,K,
         gpu_state.ptopk_index,gpu_state.ptopk_weight,gpu_state.expert_counts,0);
-    int route_tile=128;
+    const bool decode_tiles=batch<=MAX_REQUESTS;
+    int route_tile=decode_tiles?64:128;
     int routes=batch*K,max_tiles=(routes+route_tile-1)/route_tile+c.n_routed_experts;
     dsv2_launch_bucket_routes(gpu_state.ptopk_index,batch,K,
         gpu_state.expert_counts,gpu_state.expert_offsets,gpu_state.expert_cursors,
@@ -645,7 +653,10 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
         gpu_state.expert_i8_scales,gpu_state.projection_i8,
         gpu_state.projection_i8_scales,gpu_state.expert_slots,routes,H,K,0);
     auto *fused_expert_bf16=gpu_state.expert_fused_gate;
-    dsv2_launch_grouped_expert_gate_up_i8(fused_expert_bf16,
+    auto launch_gate_up=decode_tiles?
+        dsv2_launch_grouped_expert_gate_up_i8_64:
+        dsv2_launch_grouped_expert_gate_up_i8;
+    launch_gate_up(fused_expert_bf16,
         gpu_state.expert_i8,gpu_state.expert_i8_scales,
         reinterpret_cast<const int8_t *const *>(w.expert_gate_i8_table),
         reinterpret_cast<const int8_t *const *>(w.expert_up_i8_table),
@@ -656,7 +667,10 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
     dsv2_launch_pack_sorted_bf16_i8(gpu_state.expert_i8,
         gpu_state.expert_i8_scales,fused_expert_bf16,routes,
         c.moe_inter_size,0);
-    dsv2_launch_grouped_expert_down_i8_native(gpu_state.pexpert_up,
+    auto launch_down=decode_tiles?
+        dsv2_launch_grouped_expert_down_i8_native_64:
+        dsv2_launch_grouped_expert_down_i8_native;
+    launch_down(gpu_state.pexpert_up,
         gpu_state.expert_i8,gpu_state.expert_i8_scales,
         reinterpret_cast<const int8_t *const *>(w.expert_down_i8_table),
         w.expert_down_scales,
