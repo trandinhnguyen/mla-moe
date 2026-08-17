@@ -678,8 +678,11 @@ __global__ void quantize_rows_i8_kernel(int8_t *output,float *scales,
     int row=blockIdx.x;if(row>=rows)return;
     const float *src=input+(size_t)row*cols;
     float maximum=0.0f;
-    for(int i=threadIdx.x;i<cols;i+=blockDim.x)
-        maximum=fmaxf(maximum,fabsf(src[i]));
+    for(int i=threadIdx.x*4;i<cols;i+=blockDim.x*4){
+        float4 v=*reinterpret_cast<const float4 *>(src+i);
+        maximum=fmaxf(maximum,fmaxf(fmaxf(fabsf(v.x),fabsf(v.y)),
+                                    fmaxf(fabsf(v.z),fabsf(v.w))));
+    }
     maximum=wave_max(maximum);__shared__ float waves[4],scale;
     int lane=threadIdx.x&63,wave=threadIdx.x>>6;
     if(lane==0)waves[wave]=maximum;__syncthreads();
@@ -687,9 +690,17 @@ __global__ void quantize_rows_i8_kernel(int8_t *output,float *scales,
         if(lane==0){scale=maximum>0.0f?maximum/127.0f:1.0f;scales[row]=scale;}}
     __syncthreads();float inverse=1.0f/scale;
     int8_t *dst=output+(size_t)row*cols;
-    for(int i=threadIdx.x;i<cols;i+=blockDim.x){
-        float q=nearbyintf(src[i]*inverse);
-        dst[i]=(int8_t)fmaxf(-127.0f,fminf(127.0f,q));}
+    for(int i=threadIdx.x*4;i<cols;i+=blockDim.x*4){
+        float4 v=*reinterpret_cast<const float4 *>(src+i);
+        int q0=max(-127,min(127,__float2int_rn(v.x*inverse)));
+        int q1=max(-127,min(127,__float2int_rn(v.y*inverse)));
+        int q2=max(-127,min(127,__float2int_rn(v.z*inverse)));
+        int q3=max(-127,min(127,__float2int_rn(v.w*inverse)));
+        *reinterpret_cast<uint32_t *>(dst+i)=(uint8_t)(int8_t)q0|
+            ((uint32_t)(uint8_t)(int8_t)q1<<8)|
+            ((uint32_t)(uint8_t)(int8_t)q2<<16)|
+            ((uint32_t)(uint8_t)(int8_t)q3<<24);
+    }
 }
 
 __global__ void pack_sorted_bf16_i8_kernel(int8_t *output,float *scales,
