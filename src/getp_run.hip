@@ -59,6 +59,8 @@ void dsv2_quantize_expert_down(const uint16_t *const *,int8_t *,float *,
     int,int,int,hipStream_t);
 void dsv2_launch_pack_expert_i8(int8_t *,float *,const float *,const int *,
     int,int,int,hipStream_t);
+void dsv2_launch_pack_quantized_routes_i8(int8_t *,float *,const int8_t *,
+    const float *,const int *,int,int,int,hipStream_t);
 void dsv2_launch_pack_sorted_bf16_i8(int8_t *,float *,const uint16_t *,int,int,
     hipStream_t);
 void dsv2_launch_quantize_rows_i8(int8_t *,float *,const float *,int,int,
@@ -639,8 +641,9 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
         gpu_state.expert_counts,gpu_state.expert_offsets,gpu_state.expert_cursors,
         gpu_state.expert_slots,gpu_state.expert_tile_experts,
         gpu_state.expert_tile_starts,max_tiles,route_tile,0);
-    dsv2_launch_pack_expert_i8(gpu_state.expert_i8,gpu_state.expert_i8_scales,
-        input,gpu_state.expert_slots,routes,H,K,0);
+    dsv2_launch_pack_quantized_routes_i8(gpu_state.expert_i8,
+        gpu_state.expert_i8_scales,gpu_state.projection_i8,
+        gpu_state.projection_i8_scales,gpu_state.expert_slots,routes,H,K,0);
     auto *fused_expert_bf16=gpu_state.expert_fused_gate;
     dsv2_launch_grouped_expert_gate_up_i8(fused_expert_bf16,
         gpu_state.expert_i8,gpu_state.expert_i8_scales,

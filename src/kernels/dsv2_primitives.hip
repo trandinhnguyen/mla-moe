@@ -309,9 +309,9 @@ __global__ void mfma_bf16_swiglu_32x64(float *output,const uint16_t *input,
     int r0=tile_m+mt*16+(lane>>4)*4,r1=r0+32,n=tile_n+nt*16+(lane&15);
     for(int i=0;i<4;++i){
         if(n<batch&&r0+i<rows){float g=ag0[i];
-            output[(size_t)n*rows+r0+i]=(g/(1.0f+expf(-g)))*au0[i];}
+            output[(size_t)n*rows+r0+i]=(g/(1.0f+__expf(-g)))*au0[i];}
         if(n<batch&&r1+i<rows){float g=ag1[i];
-            output[(size_t)n*rows+r1+i]=(g/(1.0f+expf(-g)))*au1[i];}}
+            output[(size_t)n*rows+r1+i]=(g/(1.0f+__expf(-g)))*au1[i];}}
 }
 
 __global__ void batched_rmsnorm_kernel(
@@ -660,6 +660,19 @@ __global__ void pack_expert_i8_kernel(int8_t *output,float *scales,
         dst[i]=(int8_t)fmaxf(-127.0f,fminf(127.0f,q));}
 }
 
+__global__ void pack_quantized_routes_i8_kernel(int8_t *output,float *scales,
+    const int8_t *input,const float *input_scales,const int *slots,int routes,
+    int hidden,int topk){
+    int route=blockIdx.x;
+    if(route>=routes)return;
+    int token=slots[route]/topk;
+    const int8_t *src=input+(size_t)token*hidden;
+    int8_t *dst=output+(size_t)route*hidden;
+    for(int i=threadIdx.x*16;i<hidden;i+=blockDim.x*16)
+        *reinterpret_cast<int4 *>(dst+i)=*reinterpret_cast<const int4 *>(src+i);
+    if(threadIdx.x==0)scales[route]=input_scales[token];
+}
+
 __global__ void quantize_rows_i8_kernel(int8_t *output,float *scales,
     const float *input,int rows,int cols){
     int row=blockIdx.x;if(row>=rows)return;
@@ -684,8 +697,12 @@ __global__ void pack_sorted_bf16_i8_kernel(int8_t *output,float *scales,
     int route=blockIdx.x;if(route>=routes)return;
     const uint16_t *src=input+(size_t)route*hidden;
     float maximum=0.0f;
-    for(int i=threadIdx.x;i<hidden;i+=blockDim.x)
-        maximum=fmaxf(maximum,fabsf(load_bf16(src+i)));
+    for(int i=threadIdx.x*2;i<hidden;i+=blockDim.x*2){
+        uint32_t pair=*reinterpret_cast<const uint32_t *>(src+i);
+        float x0=__uint_as_float((pair&0xffffu)<<16);
+        float x1=__uint_as_float(pair&0xffff0000u);
+        maximum=fmaxf(maximum,fmaxf(fabsf(x0),fabsf(x1)));
+    }
     maximum=wave_max(maximum);__shared__ float waves[4],scale;
     int lane=threadIdx.x&63,wave=threadIdx.x>>6;
     if(lane==0)waves[wave]=maximum;__syncthreads();
@@ -693,9 +710,15 @@ __global__ void pack_sorted_bf16_i8_kernel(int8_t *output,float *scales,
         if(lane==0){scale=maximum>0.0f?maximum/127.0f:1.0f;scales[route]=scale;}}
     __syncthreads();float inverse=1.0f/scale;
     int8_t *dst=output+(size_t)route*hidden;
-    for(int i=threadIdx.x;i<hidden;i+=blockDim.x){
-        float q=nearbyintf(load_bf16(src+i)*inverse);
-        dst[i]=(int8_t)fmaxf(-127.0f,fminf(127.0f,q));}
+    for(int i=threadIdx.x*2;i<hidden;i+=blockDim.x*2){
+        uint32_t pair=*reinterpret_cast<const uint32_t *>(src+i);
+        float x0=__uint_as_float((pair&0xffffu)<<16);
+        float x1=__uint_as_float(pair&0xffff0000u);
+        int q0=max(-127,min(127,__float2int_rn(x0*inverse)));
+        int q1=max(-127,min(127,__float2int_rn(x1*inverse)));
+        *reinterpret_cast<uint16_t *>(dst+i)=
+            (uint16_t)((uint8_t)(int8_t)q0)|((uint16_t)(uint8_t)(int8_t)q1<<8);
+    }
 }
 
 template<bool SINGLE>
@@ -940,13 +963,13 @@ __global__ void grouped_expert_gate_up_32x128(uint16_t *gate,float *up,
     int r0=tile_m+mt*16+(lane>>4)*4,r1=r0+32,n=tile_n+nt*16+(lane&15),n2=n+64;
     #pragma unroll
     for(int i=0;i<4;++i){if(n<count&&r0+i<rows){size_t o=((size_t)offset+n)*rows+r0+i;
-        float g=ag0[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*au0[i]);}
+        float g=ag0[i];gate[o]=to_bf16_rne((g/(1.0f+__expf(-g)))*au0[i]);}
         if(n<count&&r1+i<rows){size_t o=((size_t)offset+n)*rows+r1+i;
-        float g=ag1[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*au1[i]);}
+        float g=ag1[i];gate[o]=to_bf16_rne((g/(1.0f+__expf(-g)))*au1[i]);}
         if(n2<count&&r0+i<rows){size_t o=((size_t)offset+n2)*rows+r0+i;
-        float g=bg0[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*bu0[i]);}
+        float g=bg0[i];gate[o]=to_bf16_rne((g/(1.0f+__expf(-g)))*bu0[i]);}
         if(n2<count&&r1+i<rows){size_t o=((size_t)offset+n2)*rows+r1+i;
-        float g=bg1[i];gate[o]=to_bf16_rne((g/(1.0f+expf(-g)))*bu1[i]);}}
+        float g=bg1[i];gate[o]=to_bf16_rne((g/(1.0f+__expf(-g)))*bu1[i]);}}
 }
 
 __global__ void grouped_expert_gate_up_i8_64x128(uint16_t *gate,
@@ -1018,16 +1041,16 @@ __global__ void grouped_expert_gate_up_i8_64x128(uint16_t *gate,
     for(int i=0;i<4;++i){
         if(n0<count&&r0+i<rows){float g=(float)ag0[i]*is0*gate_scales[(size_t)expert*rows+r0+i];
             float u=(float)au0[i]*is0*up_scales[(size_t)expert*rows+r0+i];
-            gate[((size_t)offset+n0)*rows+r0+i]=to_bf16_rne((g/(1.0f+expf(-g)))*u);}
+            gate[((size_t)offset+n0)*rows+r0+i]=to_bf16_rne((g/(1.0f+__expf(-g)))*u);}
         if(n0<count&&r1+i<rows){float g=(float)ag1[i]*is0*gate_scales[(size_t)expert*rows+r1+i];
             float u=(float)au1[i]*is0*up_scales[(size_t)expert*rows+r1+i];
-            gate[((size_t)offset+n0)*rows+r1+i]=to_bf16_rne((g/(1.0f+expf(-g)))*u);}
+            gate[((size_t)offset+n0)*rows+r1+i]=to_bf16_rne((g/(1.0f+__expf(-g)))*u);}
         if(n1<count&&r0+i<rows){float g=(float)bg0[i]*is1*gate_scales[(size_t)expert*rows+r0+i];
             float u=(float)bu0[i]*is1*up_scales[(size_t)expert*rows+r0+i];
-            gate[((size_t)offset+n1)*rows+r0+i]=to_bf16_rne((g/(1.0f+expf(-g)))*u);}
+            gate[((size_t)offset+n1)*rows+r0+i]=to_bf16_rne((g/(1.0f+__expf(-g)))*u);}
         if(n1<count&&r1+i<rows){float g=(float)bg1[i]*is1*gate_scales[(size_t)expert*rows+r1+i];
             float u=(float)bu1[i]*is1*up_scales[(size_t)expert*rows+r1+i];
-            gate[((size_t)offset+n1)*rows+r1+i]=to_bf16_rne((g/(1.0f+expf(-g)))*u);}}
+            gate[((size_t)offset+n1)*rows+r1+i]=to_bf16_rne((g/(1.0f+__expf(-g)))*u);}}
 }
 
 __global__ void batched_weighted_add_kernel(float *output,const float *experts,
@@ -1235,6 +1258,12 @@ extern "C" void dsv2_launch_bucket_routes(const int *idx,int tokens,int topk,
 extern "C" void dsv2_launch_pack_expert_i8(int8_t *out,float *scales,
     const float *in,const int *slots,int routes,int hidden,int topk,hipStream_t s){
     pack_expert_i8_kernel<<<routes,256,0,s>>>(out,scales,in,slots,routes,hidden,topk);
+}
+extern "C" void dsv2_launch_pack_quantized_routes_i8(int8_t *out,float *scales,
+    const int8_t *in,const float *input_scales,const int *slots,int routes,
+    int hidden,int topk,hipStream_t s){
+    pack_quantized_routes_i8_kernel<<<routes,128,0,s>>>(out,scales,in,
+        input_scales,slots,routes,hidden,topk);
 }
 extern "C" void dsv2_launch_pack_sorted_bf16_i8(int8_t *out,float *scales,
     const uint16_t *in,int routes,int hidden,hipStream_t s){
