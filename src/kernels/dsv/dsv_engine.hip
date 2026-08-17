@@ -620,14 +620,17 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
                    float *output,int batch){
     const int H=c.hidden_size,K=MOE_ACTIVE_TOP_K;
     const int SHARED=c.n_shared_experts*c.moe_inter_size;
+    /* Router and shared experts consume the same normalized rows. Quantize
+     * them once on the main stream, then let the shared stream reuse that
+     * immutable buffer while routing proceeds concurrently. */
+    dsv2_launch_quantize_rows_i8(gpu_state.projection_i8,
+        gpu_state.projection_i8_scales,input,batch,H,0);
     hip_check(hipEventRecord(moe_input_ready,0),"record MoE input ready");
     hip_check(hipStreamWaitEvent(shared_expert_stream,moe_input_ready,0),
               "wait for MoE input on shared stream");
     auto *shared_bf16=gpu_state.dense_fused_gate;
-    dsv2_launch_quantize_rows_i8(gpu_state.shared_i8,
-        gpu_state.shared_i8_scales,input,batch,H,shared_expert_stream);
-    dsv2_launch_single_gate_up_i8(shared_bf16,gpu_state.shared_i8,
-        gpu_state.shared_i8_scales,w.shared_gate_i8,w.shared_up_i8,
+    dsv2_launch_single_gate_up_i8(shared_bf16,gpu_state.projection_i8,
+        gpu_state.projection_i8_scales,w.shared_gate_i8,w.shared_up_i8,
         w.shared_gate_scales,w.shared_up_scales,batch,SHARED,H,
         shared_expert_stream);
     dsv2_launch_pack_sorted_bf16_i8(gpu_state.shared_i8,
@@ -636,8 +639,6 @@ void gpu_moe_chunk(const Config &c,DeviceLayer &w,const float *input,
     dsv2_launch_single_down_i8(output,gpu_state.shared_i8,
         gpu_state.shared_i8_scales,w.shared_down_i8,w.shared_down_scales,
         batch,H,SHARED,shared_expert_stream);
-    dsv2_launch_quantize_rows_i8(gpu_state.projection_i8,
-        gpu_state.projection_i8_scales,input,batch,H,0);
     dsv2_launch_single_down_i8(gpu_state.prouter,gpu_state.projection_i8,
         gpu_state.projection_i8_scales,w.router_i8,w.router_scales,batch,
         c.n_routed_experts,H,0);
