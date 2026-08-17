@@ -1,6 +1,10 @@
 {
   "top1_strict": 0.99,
   "ppl_rel": 0.01,
-  "meteor": 0.3,
-  "bertscore_f1": 0.9
+  "getp_prefix": 0.6,
+  "getp_min_prefix": 0.2,
+  "getp_bad_frac": 0.05,
+  "getp_cap_quorum": 0.05,
+  "meteor": 0.25,
+  "bertscore_f1": 0.83
 }

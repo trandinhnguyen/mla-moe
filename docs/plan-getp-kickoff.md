@@ -65,3 +65,30 @@ Reference impl: per request → tokenize (add_bos=0) → `forward_unabsorbed` pr
 - `./run "$DSV" getp tests/eval/dsv2lite/requests.txt /tmp/out.txt` prints
   `achieved throughput TPS (tok/s): …` and writes `/tmp/out.txt`.
 - `make eval MODEL=dsv2lite` still passes (the correctness path is untouched).
+
+## Amendment — `make getp-eval` grades the candidate's engine
+
+The Goal above says correctness is "gated by the existing harness (`make eval`)".
+That is not right, and it misled candidates. `make eval` drives `run`'s
+single-sequence `teacher`/`ppl` modes, which call the **frozen** `forward_*`
+kernels in `src/run.c` — it never calls `inference()`. It therefore says nothing
+about the candidate's engine, and its one-request-at-a-time shape read as a
+requirement: the only structure known to reproduce the golden ids was the
+reference's per-request prefill + absorbed-decode loop. That is the opposite of a
+throughput task.
+
+`make getp-eval` fixes this. Work item 3 step 4 already had the harness write one
+line of generated ids per request, "so output can be re-scored" — nothing in the
+frozen harness needed to change. `tests/eval/eval.py --tokens` scores that file, so
+`inference()` is graded on its own output and the scoring is blind to how the batch
+was scheduled. Batched prefill, continuous batching, and several requests in flight
+are all fair game.
+
+The gate is the announced accuracy gate (METEOR + BERTScore-F1, `threshold.json`).
+Free-run prefix agreement prints as a diagnostic only: greedy decoding is a hard
+argmax and a free-run sequence never recovers from one flip, so an engine using
+bf16/fp8 weights or a bf16 KV cache diverges from the fp32 reference while still
+being correct. Sameness cannot gate.
+
+`DATA=` points the eval targets at any dataset dir of the same shape, including the
+published request set fetched by `make eval-fetch`.
