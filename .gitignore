@@ -15,6 +15,16 @@
 # is expensive to regenerate (glm47 needs ~125 GB HF). Unlike the oracle dumps
 # above, it is tiny (token ids) and must not depend on re-running HF.
 
+# Fetched eval sets (published on the Hub; `make eval-fetch` re-downloads).
+# One directory per set name, so a private set never shadows the public one.
+/tests/eval/fetched/
+# Older path that eval-fetch used to write to. Kept ignored: a private set
+# dropped there must never reach git.
+/tests/eval/public/
+
+# getp output ids, written per (model, dataset) by `make getp`/`getp-eval`
+/getp_*.txt
+
 # Python
 __pycache__/
 *.pyc

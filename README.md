@@ -16,7 +16,14 @@ one readable C codebase where every operation is explicit and auditable.
   is what grades.)
 - **Python tooling**: `uv sync` installs the pinned deps from `pyproject.toml`
   (numpy, safetensors, transformers, accelerate, torch-cpu) — run this once
-  before any `uv run python ...` command below.
+  before any `uv run python ...` command below. The METEOR/BERTScore accuracy
+  tier needs the `fuzzy` extra (`uv sync --extra fuzzy`); `make getp-eval` and
+  `make eval FUZZY=1` pull it in for you. That tier also downloads metric scripts,
+  nltk data and roberta-large on first use. Run `make eval-warm` once on a
+  networked machine to fill those caches; after that `HF_HUB_OFFLINE=1 make
+  getp-eval ...` works offline (verified — `HF_DATASETS_OFFLINE` is not needed).
+  Skipping `eval-warm` on an offline box makes the accuracy tier exit with a
+  message naming the target, rather than a traceback.
 - **Model weights**: checkpoints are plain HF directories (`config.json` +
   `model.safetensors.index.json` + shards), mmap'd directly — no download or
   conversion step. On the shared cluster they live at
@@ -180,6 +187,22 @@ The frozen CPU kernels are declared in `include/engine.h`; the reference
 `inference()` calls them, so it is correct on day one. Replace those calls with
 your own GPU kernels incrementally.
 
+The request set you are scored on is published as
+[`thanhnx12/mla-moe-dataset-public`](https://huggingface.co/datasets/thanhnx12/mla-moe-dataset-public)
+— 512 prompts per model, prompt lengths 64–512, 64-token greedy fp32 references.
+Grading uses a held-out private set of the same shape, so tune against the public
+one, not against individual prompts:
+
+```sh
+make eval-fetch      # -> tests/eval/fetched/mla-moe-dataset-public/{dsv2lite,glm47}
+make getp-eval MODEL=dsv2lite MODELDIR="$DSV" STEPS=64 \
+  DATA=tests/eval/fetched/mla-moe-dataset-public/dsv2lite
+```
+
+`DATA` selects the dataset dir for `eval`/`getp`/`getp-eval`; it defaults to the
+small in-repo dev set, which is for smoke-testing, not for tuning. The fetch
+directory is named after the set, so two sets never overwrite each other.
+
 `getp` mode runs a fixed request set (`requests.txt`: line 0 = count, then one
 prompt per line) through your `inference()` and prints one end-to-end number —
 the perf score:
@@ -195,14 +218,84 @@ make getp MODEL=dsv2lite MODELDIR="$DSV"     # convenience wrapper (STEPS/OUT ov
 `warm_up()`/`finish()` are timed separately and excluded from the throughput
 number — do allocation and weight upload there, not inside `inference()`.
 
-**Correctness gate:** raising throughput must not change the output. `make eval
-MODEL=...` (teacher-forced top-1 + perplexity; `--fuzzy` adds METEOR/BERTScore)
-is the correctness gate and must keep passing its thresholds.
+**`inference()` owns the whole batch.** It is handed all `num_reqs` prompts at
+once and is free to schedule them however it likes — one at a time, batched
+prefill, continuous batching, paged KV, several requests in flight. The only
+contract is that `out_tokens[r][0..out_lens[r]-1]` ends up holding request `r`'s
+greedy continuation. The reference implementation loops one request at a time
+because that is the simplest correct start, *not* because the grader requires it;
+note that the frozen `forward_unabsorbed`/`forward_absorbed` kernels drive a
+single shared `RunState` KV cache, so batching means writing your own kernels and
+your own cache — which is the point of the exercise.
+
+**Correctness gate:** raising throughput must not change the output.
+
+```sh
+make getp-eval MODEL=dsv2lite MODELDIR="$DSV"    # the gate on YOUR engine
+make eval      MODEL=dsv2lite                    # the gate on the frozen reference paths
+```
+
+`make getp-eval` runs the timed `getp` batch and then scores the token-ids file it
+wrote against the golden completions (`<dataset>/completions.i32.txt`), so **your
+`inference()` is graded on its own output** and the scoring is blind to how you
+scheduled the batch.
+
+The **gate** is the accuracy gate: `meteor >= 0.25` and `bertscore_f1 >= 0.90`
+(`tests/eval/threshold.json`). Free-run **prefix agreement** — how many tokens each
+request emits before diverging from the reference continuation — prints alongside as
+a **diagnostic** and does not decide the verdict. It cannot: one flipped argmax
+derails every token after it, so an engine using bf16/fp8 weights or a bf16 KV cache
+diverges from the fp32 reference while still being correct. Note though that the 0.90
+raw BERTScore limit gives the gate a partial prefix-agreement effect anyway: an engine
+that diverges inside the first half of a completion can fail it. The exam accepts that
+as a property of the chosen value. `QUICK=1` prints the
+diagnostics and skips the accuracy tier's heavy deps (it grades nothing, and exits 2).
+
+**Exit codes are `tests/eval/eval.py`'s, not `make`'s.** GNU make reports its own
+status 2 for any failed recipe, so a script that drives `make getp-eval` cannot tell
+a gate failure from an environment fault. A grading script should run the timed
+batch with `make` and then call the scorer directly:
+
+```sh
+OUT="$PWD/getp_ids.txt"                  # one path, used by both commands
+STEPS=$(make -s print-getp-steps)        # the harness default, or set your own
+make getp MODEL=dsv2lite MODELDIR="$DSV" DATA="$DATA" OUT="$OUT" STEPS="$STEPS"
+uv run --extra fuzzy python tests/eval/eval.py dsv2lite \
+  -d "$DATA" --tokens "$OUT" --model-dir "$DSV" --steps "$STEPS"   # exit code below
+```
+
+Set `OUT` explicitly rather than letting it default — `make` derives the ids path from
+`MODEL` and `DATA` and never prints it. Read `STEPS` from `make print-getp-steps`
+rather than writing a number here: the default lives in `src/getp_eval.c`, and the
+scorer needs the same value the run used or its cap check describes a run that did
+not happen.
+
+**0** ok · **1** the gate failed · **2** not graded (nothing was scored — `--quick`, a
+misconfiguration, or a generation capped below the reference length) · **3**
+environment fault (missing deps, cold cache, no network, no engine binary). Only
+**1** is a candidate failure.
+
+`STEPS`/`OUT`/`RUN` are overridable as with `make getp` (`RUN=./run-ref` or
+`RUN=./submission` scores another binary); generating past the golden completion
+length is fine, the surplus is ignored, so one timed run yields both numbers.
+
+Read the prefix diagnostics even though they do not gate. A correct fp32 engine
+matches the reference token-for-token; a reduced-precision engine diverges but stays
+fluent and on-topic. Prefix agreement that collapses while your throughput jumps is
+the signal that something broke, and the accuracy gate alone will not tell you.
+Submissions are additionally reviewed by hand.
+
+`make eval` still runs the teacher-forced top-1 + perplexity ladder, but note what
+it covers: it drives `run`'s single-sequence `teacher`/`ppl` modes, i.e. the
+**frozen** kernels in `src/run.c` — it never calls your `inference()`. Keep it
+passing as the reference-path regression; `make getp-eval` is what grades you.
 
 ## Limitations
 
-Single stream (batch=1), greedy sampling, ASCII/English tokenizer (see above).
-Performance work (blocked matmuls, threading) is deferred — correctness first.
+The reference engine in `src/run.c` is single-stream (batch=1) and greedy, with an
+ASCII/English tokenizer (see above); its performance work (blocked matmuls,
+threading) is deliberately absent — correctness first. Those are properties of the
+reference, not limits on the `getp` engine you are asked to build.
 
 ## Candidate hand-off — status
 
