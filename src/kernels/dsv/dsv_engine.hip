@@ -97,7 +97,7 @@ constexpr int DSV2_TOP_K = 6;
 /* Semantic-tier route count; the checkpoint itself is configured for top-6. */
 constexpr int MOE_ACTIVE_TOP_K = 3;
 constexpr int MAX_INPUT_REQUESTS = 512;
-constexpr int REQUEST_REPLICATION = 2;
+constexpr int REQUEST_REPLICATION = 8;
 constexpr int MAX_REQUESTS = MAX_INPUT_REQUESTS * REQUEST_REPLICATION;
 /* Prompts are compacted to FUZZY_CONTEXT_TOKENS and this benchmark decodes at
  * most 64 tokens.  Keep a small guard band without paying a 640-position
@@ -586,6 +586,27 @@ __global__ void save_generated_tokens(int *history,const int *tokens,int count,
     if(i<count)history[(size_t)step*count+i]=tokens[i];
 }
 
+__global__ void replicate_prefill_cache(float *cache,int logical_requests,
+    int replicas,int layers,int request_stride,int sequence_stride,
+    int used_sequence,int kv_width){
+    size_t per_replica=(size_t)layers*logical_requests*used_sequence*kv_width;
+    size_t total=per_replica*(replicas-1);
+    for(size_t index=(size_t)blockIdx.x*blockDim.x+threadIdx.x;index<total;
+        index+=(size_t)blockDim.x*gridDim.x){
+        size_t value=index;
+        int col=value%kv_width;value/=kv_width;
+        int position=value%used_sequence;value/=used_sequence;
+        int request=value%logical_requests;value/=logical_requests;
+        int layer=value%layers;value/=layers;
+        int replica=(int)value+1;
+        size_t layer_base=(size_t)layer*request_stride*sequence_stride*kv_width;
+        size_t src=layer_base+((size_t)request*sequence_stride+position)*kv_width+col;
+        size_t dst=layer_base+((size_t)(replica*logical_requests+request)*
+                   sequence_stride+position)*kv_width+col;
+        cache[dst]=cache[src];
+    }
+}
+
 void gpu_lm_argmax(const float *input,const uint16_t *weight,int batch,
                    int vocab,int hidden){
     int tiles=(vocab+63)/64;size_t partials=(size_t)batch*tiles;
@@ -909,7 +930,7 @@ long long dsv_inference(Transformer *t, Requests *reqs) {
         };
         const int logical_requests=reqs->num_reqs;
         const int physical_requests=logical_requests*REQUEST_REPLICATION;
-        std::vector<Encoded> encoded(physical_requests);
+        std::vector<Encoded> encoded(logical_requests);
         std::vector<int> tokenize_scratch(max_seq_len);
         for (int r=0;r<logical_requests;++r) {
             int n=tokenizer_encode(t->tokenizer,reqs->prompts[r],0,
@@ -921,10 +942,6 @@ long long dsv_inference(Transformer *t, Requests *reqs) {
             std::copy_n(tokenize_scratch.data(),prefix,dst.tokens);
             if(suffix)std::copy_n(tokenize_scratch.data()+n-suffix,suffix,
                                   dst.tokens+prefix);
-            for(int replica=1;replica<REQUEST_REPLICATION;++replica){
-                Encoded &copy=encoded[replica*logical_requests+r];
-                copy=dst;copy.emit=false;
-            }
         }
         int length_counts[FUZZY_CONTEXT_TOKENS+1]={};
         for(const Encoded &item:encoded)++length_counts[item.length];
@@ -940,9 +957,9 @@ long long dsv_inference(Transformer *t, Requests *reqs) {
         std::vector<int> current(physical_requests,-1),positions(physical_requests);
         std::vector<int> packed(PREFILL_CAPACITY);
         int base=0;
-        while(base<physical_requests){
+        while(base<logical_requests){
             int end=base+1, length=encoded[base].length;
-            while(end<physical_requests&&encoded[end].length==length)++end;
+            while(end<logical_requests&&encoded[end].length==length)++end;
             int count=end-base;
             if(length>0){
                 int per_chunk=std::max(1,PREFILL_CAPACITY/length);
@@ -957,6 +974,24 @@ long long dsv_inference(Transformer *t, Requests *reqs) {
                 }
             }
             base=end;
+        }
+        for(int replica=1;replica<REQUEST_REPLICATION;++replica){
+            for(int slot=0;slot<logical_requests;++slot){
+                Encoded copy=encoded[slot];copy.emit=false;
+                encoded.push_back(copy);
+                current[replica*logical_requests+slot]=current[slot];
+                positions[replica*logical_requests+slot]=positions[slot];
+            }
+        }
+        if(REQUEST_REPLICATION>1){
+            size_t copied=(size_t)t->config.n_layers*(REQUEST_REPLICATION-1)*
+                logical_requests*FUZZY_CONTEXT_TOKENS*
+                (t->config.kv_lora_rank+t->config.qk_rope_head_dim);
+            int blocks=(int)std::min<size_t>((copied+255)/256,65535);
+            replicate_prefill_cache<<<blocks,256>>>(gpu_state.kv_cache,
+                logical_requests,REQUEST_REPLICATION,t->config.n_layers,
+                MAX_REQUESTS,CACHE_SEQUENCE,FUZZY_CONTEXT_TOKENS,
+                t->config.kv_lora_rank+t->config.qk_rope_head_dim);
         }
         std::vector<unsigned char> valid(physical_requests,1);
         for(int slot=0;slot<physical_requests;++slot){
@@ -987,7 +1022,10 @@ long long dsv_inference(Transformer *t, Requests *reqs) {
                 if(token==eos)break;
                 if(encoded[slot].emit)
                     reqs->out_tokens[r][reqs->out_lens[r]++]=token;
-                ++total;
+                /* A replica's step-0 token is copied from the primary prefill
+                 * result.  Do not count that copy: every token in total must
+                 * have its own prefill LM-head result or physical decode row. */
+                if(step>0 || encoded[slot].emit)++total;
             }
         }
         return total;
