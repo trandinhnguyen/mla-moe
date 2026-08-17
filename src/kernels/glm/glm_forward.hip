@@ -25,18 +25,29 @@ static void launch_rmsnorm(float *y, const float *x, const bf16_t *w, int n_rows
 {
     if (x_stride < 0) x_stride = n;
     if (y_stride < 0) y_stride = n;
-    rmsnorm_kernel<<<n_rows, 256, 0, g_str>>>(y, x, w, n, eps, x_stride, y_stride);
+    if ((n & 3) == 0 && (x_stride & 3) == 0 && (y_stride & 3) == 0 && n <= 4 * RN_REGS * 256)
+        rmsnorm_f4_kernel<<<n_rows, 256, 0, g_str>>>(y, x, w, n, eps, x_stride, y_stride);
+    else
+        rmsnorm_kernel<<<n_rows, 256, 0, g_str>>>(y, x, w, n, eps, x_stride, y_stride);
+}
+
+/* residual-add immediately followed by the RMSNorm of the same buffer: one kernel
+ * (see elementwise.hip). Both call sites per layer have this shape -- after
+ * attention, and after the FFN where the norm belongs to the next layer. */
+static void launch_residual_rmsnorm(float *x, float *y, const float *branch,
+                                    const bf16_t *w, int n_rows, int n, float eps)
+{
+    residual_rmsnorm_kernel<<<n_rows, 256, 0, g_str>>>(x, y, branch, w, n, eps, n, n);
 }
 
 static void launch_residual_add(float *xs, const float *add, int n)
 {
-    residual_add_kernel<<<ceil_div(n, 256), 256, 0, g_str>>>(xs, add, n);
+    if ((n & 3) == 0)
+        residual_add_f4_kernel<<<ceil_div(n / 4, 256), 256, 0, g_str>>>(xs, add, n / 4);
+    else
+        residual_add_kernel<<<ceil_div(n, 256), 256, 0, g_str>>>(xs, add, n);
 }
 
-static void launch_silu_mul(float *hb, const float *hb2, int n)
-{
-    silu_mul_kernel<<<ceil_div(n, 256), 256, 0, g_str>>>(hb, hb2, n);
-}
 
 /* Per-head GEMM (per-head weight and per-head X): qabs = q_nope @ W_UK^T and
  * ctx = clat @ W_UV^T. Picks the 128x128 tile when its coarser grid still fills
@@ -90,16 +101,29 @@ static void launch_matmul(float *Y, const float *X, const bf16_t *W, int n_rows,
 /* Per-row symmetric int8 quantisation of an activation block. The fast kernel
  * keeps the row in registers between the abs-max and the quantise pass (one read
  * instead of two) and moves 16 B per instruction, but that caps the row at
- * 4*QA_REGS*256 = 2048 elements. That covers every hot call (hidden 2048, MoE
- * intermediate 1536); only the dense-layer FFN down projection (K = 10240) takes
- * the scalar kernel. */
+ * 4*QA_REGS*256 = 4096 elements. That covers every hot call (hidden 2048, MoE
+ * intermediate 1536, o_proj 2560); only the dense-layer FFN down projection
+ * (K = 10240) takes the scalar kernel, and that is one layer of 47. */
 static void launch_quant_act(const float *X, int8_t *Q, float *scale,
                              int rows, int K, int x_stride)
 {
-    if ((K & 3) == 0 && (x_stride & 3) == 0 && K <= 2048)
+    if ((K & 3) == 0 && (x_stride & 3) == 0 && K <= 4 * QA_REGS * 256)
         quant_act_rows_i8_fast_kernel<<<rows, 256, 0, g_str>>>(X, Q, scale, rows, K, x_stride);
     else
         quant_act_rows_i8_kernel<<<rows, 256, 0, g_str>>>(X, Q, scale, rows, K, x_stride);
+}
+
+/* run65: bf16 activation in. Same register-budget split as the fp32 pair above --
+ * the attention context is NH*VHD = 5120 wide, past what one register slot set can
+ * hold, and quantising only the first 4096 columns of it is exactly the bug this
+ * split exists to prevent. */
+static void launch_quant_act(const bf16_t *X, int8_t *Q, float *scale,
+                             int rows, int K, int x_stride)
+{
+    if ((K & 3) == 0 && (x_stride & 3) == 0 && K <= 4 * QA_REGS * 256)
+        quant_act_rows_i8_bf_kernel<<<rows, 256, 0, g_str>>>(X, Q, scale, rows, K, x_stride);
+    else
+        quant_act_rows_i8_bf_big_kernel<<<rows, 256, 0, g_str>>>(X, Q, scale, rows, K, x_stride);
 }
 
 /* W8A8 dense matmul. Routes on int8-table presence: a NULL Wq means the caller
@@ -109,28 +133,49 @@ static void launch_quant_act(const float *X, int8_t *Q, float *scale,
  * (halves total L2 traffic: with a square tile the weight and activation re-reads
  * are equal and both scale as 1/tile, so both dims must double), else the 64x64
  * tile, which keeps occupancy on the narrow projections (q_a N=768, kv_a N=576). */
-/* lm_head. Deliberately bf16 (int8 weights here perturb the greedy argmax for
- * +0.4% throughput -- measured, rejected), but its activation goes in as bf16:
- * with N = vocab = 154880 there are 1210 column tiles, so the activation is
- * re-read 1210 times and fp32 would double the dominant traffic. */
-static void launch_matmul_i8_pre(float *Y, const int8_t *Xq, const float *xsc,
+/* lm_head + argmax, fused. Deliberately bf16 weights (int8 here perturbs the
+ * greedy argmax for +0.4% throughput -- measured, rejected), activation narrowed
+ * to bf16 because with N = vocab there are 1210 column tiles and the kernel
+ * narrows in LDS anyway, and the argmax folded into the GEMM epilogue so the
+ * logits are never materialised: that buffer was 714 MB -- more than the whole
+ * remaining VRAM headroom -- and it was written and read back every step.
+ * Technique borrowed from the DeepSeek engine (mfma_bf16_gemm_argmax_32x64). */
+static void launch_lm_head_argmax(const float *X, const bf16_t *W, int rows, int d_out,
+                                  int n_in, int *out, const int *slotmap, int *tokrec,
+                                  int rec_stride, int step, const int *stepp,
+                                  int *pos, int cap)
+{
+    const int tiles = ceil_div(d_out, 128);
+    int n = rows * n_in;
+    bf16_t *xbf = (bf16_t *)sbuf(B_XBF16, (size_t)n * sizeof(bf16_t));
+    narrow_bf16_kernel<<<ceil_div(n, 256), 256, 0, g_str>>>(xbf, X, n);
+    float *pv = (float *)sbuf(B_LMPV, (size_t)rows * tiles * sizeof(float));
+    int   *pi = (int *)  sbuf(B_LMPI, (size_t)rows * tiles * sizeof(int));
+    dim3 grid(tiles, ceil_div(rows, 128));
+    matmul_mfma_128_xbf_argmax_kernel<<<grid, 256, 0, g_str>>>(pv, pi, xbf, W, rows,
+                                                              d_out, n_in, n_in, tiles);
+    argmax_reduce_kernel<<<rows, 256, 0, g_str>>>(pv, pi, tiles, out, slotmap, tokrec,
+                                                 rec_stride, step, stepp, pos, cap);
+}
+
+template <typename OT>
+static void launch_matmul_i8_pre(OT *Y, const int8_t *Xq, const float *xsc,
                                  const int8_t *Wq, const float *Ws,
                                  int n_rows, int d_out, int n_in, int y_stride);
 
-static void launch_lm_head(float *Y, const float *X, const bf16_t *W,
-                           int n_rows, int d_out, int n_in)
+/* W8A8 with an explicit output/activation type. Used where the consumer narrows
+ * anyway (bf16 Q tile, bf16 FFN intermediate) or the producer already did (bf16
+ * attention context). The int8 weight table is mandatory here -- there is no bf16
+ * weight resident to fall back to. */
+template <typename OT, typename XT>
+static void launch_matmul_w8a8_t(OT *Y, const XT *X, const int8_t *Wq, const float *Ws,
+                                 int n_rows, int d_out, int n_in,
+                                 int x_stride = -1, int y_stride = -1)
 {
-    int b128 = ceil_div(d_out, 128) * ceil_div(n_rows, 128);
-    if (n_rows >= 128 && d_out >= 128 && b128 >= 96) {
-        bf16_t *xbf = (bf16_t *)sbuf(B_XBF16, (size_t)n_rows * n_in * sizeof(bf16_t));
-        int n = n_rows * n_in;
-        narrow_bf16_kernel<<<ceil_div(n, 256), 256, 0, g_str>>>(xbf, X, n);
-        dim3 grid(ceil_div(d_out, 128), ceil_div(n_rows, 128));
-        matmul_mfma_128_xbf_kernel<<<grid, 256, 0, g_str>>>(Y, xbf, W, n_rows, d_out,
-                                                           n_in, n_in, d_out);
-    } else {
-        launch_matmul(Y, X, W, n_rows, d_out, n_in);
-    }
+    if (x_stride < 0) x_stride = n_in;
+    if (y_stride < 0) y_stride = d_out;
+    launch_quant_act(X, b_act_i8, b_act_sc, n_rows, n_in, x_stride);
+    launch_matmul_i8_pre(Y, b_act_i8, b_act_sc, Wq, Ws, n_rows, d_out, n_in, y_stride);
 }
 
 static void launch_matmul_w8a8(float *Y, const float *X, const bf16_t *Wbf,
@@ -139,7 +184,11 @@ static void launch_matmul_w8a8(float *Y, const float *X, const bf16_t *Wbf,
 {
     if (x_stride < 0) x_stride = n_in;
     if (y_stride < 0) y_stride = d_out;
-    if (Wq && n_rows >= 4)
+    /* run65: no n_rows floor any more. The bf16 weight is not even uploaded now
+     * (see glm_weights.hip), so there is nothing to fall back TO -- the small-M
+     * escape hatch existed for the 1-row warm-up decode and would dereference a
+     * NULL weight. int8 is the only path for every weight that has a table. */
+    if (Wq)
     {
         launch_quant_act(X, b_act_i8, b_act_sc, n_rows, n_in, x_stride);
         launch_matmul_i8_pre(Y, b_act_i8, b_act_sc, Wq, Ws, n_rows, d_out, n_in, y_stride);
@@ -152,7 +201,8 @@ static void launch_matmul_w8a8(float *Y, const float *X, const bf16_t *Wbf,
 
 /* The int8 GEMM alone, for callers that already produced quantised activations
  * (the SwiGLU path fuses silu+quantise into one kernel). */
-static void launch_matmul_i8_pre(float *Y, const int8_t *Xq, const float *xsc,
+template <typename OT>
+static void launch_matmul_i8_pre(OT *Y, const int8_t *Xq, const float *xsc,
                                  const int8_t *Wq, const float *Ws,
                                  int n_rows, int d_out, int n_in, int y_stride)
 {
@@ -161,35 +211,57 @@ static void launch_matmul_i8_pre(float *Y, const int8_t *Xq, const float *xsc,
         if (n_rows >= 128 && d_out >= 128 && b128 >= 96 && (n_in & 31) == 0)
         {
             dim3 grid(ceil_div(d_out, 128), ceil_div(n_rows, 128));
-            matmul_mfma_i8i8_128_w_kernel<<<grid, 256, 0, g_str>>>(Y, Xq, xsc, Wq, Ws,
+            matmul_mfma_i8i8_128_w_kernel<OT><<<grid, 256, 0, g_str>>>(Y, Xq, xsc, Wq, Ws,
                                                          n_rows, d_out, n_in, n_in, y_stride);
         }
         else
         {
             dim3 grid(ceil_div(d_out, MM_TILE), ceil_div(n_rows, MM_TILE));
-            matmul_mfma_i8i8_kernel<<<grid, 256, 0, g_str>>>(Y, Xq, xsc, Wq, Ws,
+            matmul_mfma_i8i8_kernel<OT><<<grid, 256, 0, g_str>>>(Y, Xq, xsc, Wq, Ws,
                                                    n_rows, d_out, n_in, n_in, y_stride);
         }
     }
 }
 
-static void launch_swiglu_w8a8(float *dst, const float *x,
+/* run65: the two hidden buffers are bf16. They are written by the gate/up GEMMs and
+ * read by silu+quantise, which turns them into int8 -- fp32 was 2x the bytes for
+ * mantissa nobody read. (void)gate/up/down: the bf16 weights are no longer resident,
+ * the int8 tables are mandatory. */
+template <typename OT>
+static void launch_swiglu_w8a8(OT *dst, const float *x,
                                const bf16_t *gate, const int8_t *gq, const float *gs,
                                const bf16_t *up,   const int8_t *uq, const float *us,
                                const bf16_t *down, const int8_t *dq, const float *ds,
-                               int n_rows, int inter, int hidden, float *hb, float *hb2)
+                               int n_rows, int inter, int hidden, bf16_t *hb, bf16_t *hb2)
 {
-    launch_matmul_w8a8(hb,  x, gate, gq, gs, n_rows, inter, hidden);
-    launch_matmul_w8a8(hb2, x, up,   uq, us, n_rows, inter, hidden);
-    if (dq && (inter & 3) == 0 && inter <= 2048 && n_rows >= 4) {
-        /* silu(gate)*up -> int8 in one pass, no fp32 round trip (see quant.hip). */
-        silu_mul_quant_kernel<<<n_rows, 256, 0, g_str>>>(hb, hb2, b_act_i8, b_act_sc,
-                                                        n_rows, inter);
-        launch_matmul_i8_pre(dst, b_act_i8, b_act_sc, dq, ds, n_rows, hidden, inter, hidden);
-    } else {
-        launch_silu_mul(hb, hb2, n_rows * inter);
-        launch_matmul_w8a8(dst, hb, down, dq, ds, n_rows, hidden, inter);
-    }
+    (void)gate; (void)up; (void)down;
+    /* Quantise x ONCE: gate and up take the same activation, and going through
+     * launch_matmul_w8a8_t twice quantised it twice into the same buffer -- a full
+     * extra read of x plus an extra int8 write per FFN per layer. */
+    launch_quant_act(x, b_act_i8, b_act_sc, n_rows, hidden, hidden);
+    launch_matmul_i8_pre(hb,  b_act_i8, b_act_sc, gq, gs, n_rows, inter, hidden, inter);
+    launch_matmul_i8_pre(hb2, b_act_i8, b_act_sc, uq, us, n_rows, inter, hidden, inter);
+    if (inter <= 4 * QA_REGS * 256)
+        silu_mul_quant_bf_kernel<<<n_rows, 256, 0, g_str>>>(hb, hb2, b_act_i8, b_act_sc,
+                                                            n_rows, inter);
+    else   /* dense layer only: inter = 10240, too wide for the register form */
+        silu_mul_quant_bf_big_kernel<<<n_rows, 256, 0, g_str>>>(hb, hb2, b_act_i8, b_act_sc,
+                                                                n_rows, inter);
+    launch_matmul_i8_pre(dst, b_act_i8, b_act_sc, dq, ds, n_rows, hidden, inter, hidden);
+}
+
+/* bf16 Q tile (prefill): the attention kernel converts Q to bf16 for its MFMA
+ * anyway, so writing it in bf16 halves both the store and every re-read. */
+static void launch_project_q_bf(const Config *c, int l, const float *xn, bf16_t *q,
+                                int n_rows, float *qa_scratch)
+{
+    launch_matmul_w8a8_t(qa_scratch, xn, dq_qa[l], ds_qa[l], n_rows, c->q_lora_rank,
+                         c->hidden_size);
+    launch_rmsnorm(qa_scratch, qa_scratch, d_w.q_a_layernorm[l], n_rows,
+                   c->q_lora_rank, c->mla_norm_eps);
+    launch_matmul_w8a8_t(q, qa_scratch, dq_qb[l], ds_qb[l], n_rows,
+                         c->n_heads * (c->qk_nope_head_dim + c->qk_rope_head_dim),
+                         c->q_lora_rank);
 }
 
 static void launch_project_q(const Config *c, int l, const float *xn, float *q,
@@ -228,16 +300,26 @@ static int inter_max_of(const Config *c)
  * plus the shared expert. `out` is overwritten. hb/hb2 hold >= n_rows*inter_max
  * floats (caller's scratch). Uses the persistent b_* MoE buffers (sized g_cap). */
 static void ffn_batched(const Config *c, int l, const float *xn, float *out,
-                        int n_rows, float *hb, float *hb2)
+                        int n_rows, bf16_t *hb, bf16_t *hb2)
 {
     const int H = c->hidden_size;
     if (l < c->first_k_dense)
     {
-        launch_swiglu_w8a8(out, xn,
-            d_w.dense_gate[l], dq_dg?dq_dg[l]:NULL, dq_dg?ds_dg[l]:NULL,
-            d_w.dense_up[l],   dq_du?dq_du[l]:NULL, dq_du?ds_du[l]:NULL,
-            d_w.dense_down[l], dq_dd?dq_dd[l]:NULL, dq_dd?ds_dd[l]:NULL,
-            n_rows, c->dense_inter_size, H, hb, hb2);
+        /* The dense FFN is the only place inter_max (10240) is used -- one layer of
+         * 47 -- and it is row-parallel, so run it in row blocks of DENSE_ROWS
+         * instead of all T rows at once. That is what sizes hb/hb2: at T=16384 the
+         * full-width version needed T*10240*4 = 671 MB each, 1.34 GB of scratch for
+         * a single layer, on an engine that runs with 0.6 GB of VRAM to spare. */
+        const int step = DENSE_ROWS;
+        for (int r0 = 0; r0 < n_rows; r0 += step)
+        {
+            int nr = n_rows - r0 < step ? n_rows - r0 : step;
+            launch_swiglu_w8a8(out + (size_t)r0 * H, xn + (size_t)r0 * H,
+                d_w.dense_gate[l], dq_dg?dq_dg[l]:NULL, dq_dg?ds_dg[l]:NULL,
+                d_w.dense_up[l],   dq_du?dq_du[l]:NULL, dq_du?ds_du[l]:NULL,
+                d_w.dense_down[l], dq_dd?dq_dd[l]:NULL, dq_dd?ds_dd[l]:NULL,
+                nr, c->dense_inter_size, H, hb, hb2);
+        }
         return;
     }
     const int NR = c->n_routed_experts, K = c->n_experts_per_tok, I = c->moe_inter_size;
@@ -276,13 +358,9 @@ static void ffn_batched(const Config *c, int l, const float *xn, float *out,
         d_epq_gate[l], d_eps_gate[l], b_eoff, b_sorted_slot, I, H, H, 1);
     moe_grouped_mfma_i8i8_128_w_kernel<<<gGU, 256, 0, g_str>>>(b_hb2k, b_xn_i8, b_xn_scale,
         d_epq_up[l], d_eps_up[l], b_eoff, b_sorted_slot, I, H, H, 1);
-    /* silu(gate) * up, reduced and quantised in one pass (see quant.hip). */
-    if ((I & 3) == 0 && I <= 2048)
-        silu_mul_quant_kernel<<<T, 256, 0, g_str>>>(b_hbk, b_hb2k, b_hbk_i8, b_hbk_scale, T, I);
-    else {
-        launch_silu_mul(b_hbk, b_hb2k, T * I);
-        launch_quant_act(b_hbk, b_hbk_i8, b_hbk_scale, T, I, I);
-    }
+    /* silu(gate) * up, reduced and quantised in one pass (see quant.hip). The
+     * fp32 fallback is gone: warm_up hard-checks moe_inter <= 4*QA_REGS*256. */
+    silu_mul_quant_bf_kernel<<<T, 256, 0, g_str>>>(b_hbk, b_hb2k, b_hbk_i8, b_hbk_scale, T, I);
     moe_grouped_mfma_i8i8_128_w_kernel<<<gD, 256, 0, g_str>>>(b_downk, b_hbk_i8, b_hbk_scale,
         d_epq_down[l], d_eps_down[l], b_eoff, b_sorted_slot, H, I, I, 0);
     /* Shared expert first: the gather below folds it in, so the routed sum, the
@@ -292,7 +370,7 @@ static void ffn_batched(const Config *c, int l, const float *xn, float *out,
         d_w.shared_up[l],   dq_su?dq_su[l]:NULL, dq_su?ds_su[l]:NULL,
         d_w.shared_down[l], dq_sd?dq_sd[l]:NULL, dq_sd?ds_sd[l]:NULL,
         n_rows, c->n_shared_experts * c->moe_inter_size, H, hb, hb2);
-    dim3 gSc(ceil_div(H, 256), n_rows);
+    dim3 gSc(n_rows, ceil_div(H, 256));
     moe_gather_add_kernel<<<gSc, 256, 0, g_str>>>(out, b_downk, b_sorted_wt, b_inv,
                                                  b_shared, K, H);
 }
@@ -324,7 +402,7 @@ static void device_forward_prefill_batched(Transformer *t, int T, int nseq,
     const int VHD = c->v_head_dim, KVL = c->kv_lora_rank, KVD = KVL + QKR, VOC = c->vocab_size;
     const float scale = c->softmax_scale, eps = c->rms_eps;
     const int kv_stride = (QKN + VHD) * KVL;
-    const size_t layer_stride = (size_t)g_batch * g_cap * KVD;
+    const size_t layer_stride = (size_t)(g_kvslots + 1) * g_cap * KVD;   /* run67 */
     const int slot_stride = g_cap * KVD;
     const int inter_max = inter_max_of(c);
 
@@ -369,15 +447,21 @@ static void device_forward_prefill_batched(Transformer *t, int T, int nseq,
     float *xs    = (float *)sbuf(B_XS,    (size_t)T * H * sizeof(float));
     float *xb    = (float *)sbuf(B_XB,    (size_t)T * H * sizeof(float));
     float *comp  = (float *)sbuf(B_COMP,  (size_t)T * KVD * sizeof(float));
-    float *qall  = (float *)sbuf(B_QALL,  (size_t)T * NH * QHD * sizeof(float));
+    bf16_t *qall = (bf16_t *)sbuf(B_QALL, (size_t)T * NH * QHD * sizeof(bf16_t));
     float *kvlin = (float *)sbuf(B_KVLIN, (size_t)T * KVD * sizeof(float));
-    float *knope = (float *)sbuf(B_KNOPE, (size_t)NH * T * QKN * sizeof(float));
-    float *value = (float *)sbuf(B_VALUE, (size_t)NH * T * VHD * sizeof(float));
-    float *ctx   = (float *)sbuf(B_CTX,   (size_t)T * NH * VHD * sizeof(float));
+    /* bf16: only attn_prefill_mfma reads these and it narrows them anyway. */
+    bf16_t *knope = (bf16_t *)sbuf(B_KNOPE, (size_t)NH * T * QKN * sizeof(bf16_t));
+    bf16_t *value = (bf16_t *)sbuf(B_VALUE, (size_t)NH * T * VHD * sizeof(bf16_t));
+    bf16_t *ctx  = (bf16_t *)sbuf(B_CTX,  (size_t)T * NH * VHD * sizeof(bf16_t));
     float *ao    = (float *)sbuf(B_AO,    (size_t)T * H * sizeof(float));
     float *mo    = (float *)sbuf(B_MO,    (size_t)T * H * sizeof(float));
-    float *hb    = (float *)sbuf(B_HB,    (size_t)T * inter_max * sizeof(float));
-    float *hb2   = (float *)sbuf(B_HB2,   (size_t)T * inter_max * sizeof(float));
+    /* hb/hb2 hold one SwiGLU hidden block. The MoE layers' shared expert needs
+     * T x moe_inter; the single dense layer needs DENSE_ROWS x dense_inter because
+     * ffn_batched chunks its rows (see there). Size for whichever is larger. */
+    const size_t hb_elems = (size_t)T * c->moe_inter_size > (size_t)DENSE_ROWS * inter_max
+                          ? (size_t)T * c->moe_inter_size : (size_t)DENSE_ROWS * inter_max;
+    bf16_t *hb   = (bf16_t *)sbuf(B_HB,   hb_elems * sizeof(bf16_t));
+    bf16_t *hb2  = (bf16_t *)sbuf(B_HB2,  hb_elems * sizeof(bf16_t));
     float *lastx = (float *)sbuf(B_PLASTX,(size_t)nseq * H * sizeof(float));
 
     const size_t rope_sh = c->rope_interleaved ? (size_t)QKR * sizeof(float) : 0;
@@ -387,11 +471,13 @@ static void device_forward_prefill_batched(Transformer *t, int T, int nseq,
     for (int l = 0; l < c->n_layers; l++)
     {
         int8_t *cache_base = d_kv_cache + (size_t)l * layer_stride;
-        float  *scale_base = d_kv_scale + (size_t)l * g_batch * g_cap;
+        float  *scale_base = d_kv_scale + (size_t)l * (g_kvslots + 1) * g_cap;
 
-        launch_rmsnorm(xb, xs, d_w.input_layernorm[l], T, H, eps);
-        launch_project_q(c, l, xb, qall, T, qa);
-        rope_pos_kernel<<<dim3(T, NH), QKR / 2, rope_sh, g_str>>>(qall + QKN, NH, NH * QHD, QHD,
+        /* Layer 0 only: every later input norm is fused with the FFN residual
+         * that precedes it, at the bottom of this loop. */
+        if (l == 0) launch_rmsnorm(xb, xs, d_w.input_layernorm[0], T, H, eps);
+        launch_project_q_bf(c, l, xb, qall, T, qa);
+        rope_pos_bf_kernel<<<dim3(T, NH), QKR / 2, rope_sh, g_str>>>(qall + QKN, NH, NH * QHD, QHD,
                                                            d_pos, QKR, c->rope_interleaved, d_inv_freq);
 
         launch_matmul_w8a8(comp, xb, d_w.kv_a_proj[l], dq_kva?dq_kva[l]:NULL, dq_kva?ds_kva[l]:NULL, T, KVD, H);
@@ -405,26 +491,20 @@ static void device_forward_prefill_batched(Transformer *t, int T, int nseq,
 
         /* Per-head knope[h] = kvlin @ W_UK[h]^T and value[h] = kvlin @ W_UV[h]^T
          * (kvlin shared across heads) folded into 2 head-batched MFMA GEMMs. */
+        /* Both are bandwidth-bound on re-reading that shared kvlin, so: the 128-wide
+         * tile (halves the re-reads), kvlin narrowed to bf16 once up front (the
+         * kernel narrows it in LDS anyway), and bf16 OUTPUT (attention narrows it
+         * too). 4.4 GB -> 0.8 GB per layer per chunk. See gemm.hip. */
         {
-            dim3 gK(ceil_div(QKN, MM_TILE), ceil_div(T, MM_TILE), NH);
-            /* Both calls are bandwidth-bound on re-reading the SHARED kvlin, so use
-             * the 128-wide tile (halves the re-reads) with kvlin narrowed to bf16
-             * once (the kernel narrows it in LDS anyway). See gemm.hip. */
-            if (T >= 128 && ceil_div(T, 128) * NH >= 96) {
+            {
                 bf16_t *kvbf = (bf16_t *)sbuf(B_KVBF, (size_t)T * KVD * sizeof(bf16_t));
                 narrow_bf16_kernel<<<ceil_div(T * KVD, 256), 256, 0, g_str>>>(kvbf, kvlin, T * KVD);
                 dim3 gK2(ceil_div(QKN, 128), ceil_div(T, 128), NH);
-                matmul_headw_mfma_128_xbf_kernel<<<gK2, 256, 0, g_str>>>(knope, kvbf, d_w.W_UK[l],
+                matmul_headw_mfma_128_xbf_bfout_kernel<<<gK2, 256, 0, g_str>>>(knope, kvbf, d_w.W_UK[l],
                                                        T, QKN, KVL, KVD, kv_stride, T * QKN);
                 dim3 gV2(ceil_div(VHD, 128), ceil_div(T, 128), NH);
-                matmul_headw_mfma_128_xbf_kernel<<<gV2, 256, 0, g_str>>>(value, kvbf, d_w.W_UV[l],
+                matmul_headw_mfma_128_xbf_bfout_kernel<<<gV2, 256, 0, g_str>>>(value, kvbf, d_w.W_UV[l],
                                                        T, VHD, KVL, KVD, kv_stride, T * VHD);
-            } else {
-                matmul_headw_mfma_pf_kernel<<<gK, 256, 0, g_str>>>(knope, kvlin, d_w.W_UK[l], T, QKN, KVL,
-                                                      KVD, kv_stride, T * QKN);
-                dim3 gV(ceil_div(VHD, MM_TILE), ceil_div(T, MM_TILE), NH);
-                matmul_headw_mfma_pf_kernel<<<gV, 256, 0, g_str>>>(value, kvlin, d_w.W_UV[l], T, VHD, KVL,
-                                                      KVD, kv_stride, T * VHD);
             }
         }
 
@@ -435,26 +515,29 @@ static void device_forward_prefill_batched(Transformer *t, int T, int nseq,
         attn_prefill_mfma_kernel<<<dim3(n_qtile, NH), 256, 0, g_str>>>(ctx, qall, knope, kvlin, value,
                                                              d_qtq0, d_qtqs, d_qtqe, T, NH,
                                                              QHD, QKN, QKR, KVD, KVL, VHD, scale);
-        launch_matmul_w8a8(ao, ctx, d_w.o_proj[l], dq_op?dq_op[l]:NULL, dq_op?ds_op[l]:NULL, T, H, NH * VHD);
-        launch_residual_add(xs, ao, T * H);
-
-        launch_rmsnorm(xb, xs, d_w.post_attn_norm[l], T, H, eps);
+        launch_matmul_w8a8_t(ao, ctx, dq_op[l], ds_op[l], T, H, NH * VHD);
+        launch_residual_rmsnorm(xs, xb, ao, d_w.post_attn_norm[l], T, H, eps);
         ffn_batched(c, l, xb, mo, T, hb, hb2);
-        launch_residual_add(xs, mo, T * H);
+        /* Fuse this residual with the next layer's input norm. The final norm is
+         * applied to the gathered last-token rows instead, so the last layer's
+         * residual stays a plain add. */
+        if (l + 1 < c->n_layers)
+            launch_residual_rmsnorm(xs, xb, mo, d_w.input_layernorm[l + 1], T, H, eps);
+        else
+            launch_residual_add(xs, mo, T * H);
     }
 
     /* First token of each prompt = argmax of its last position's logits. Gather
      * those rows, norm, lm_head (batched over nseq), argmax. */
     gather_rows_kernel<<<nseq, 256, 0, g_str>>>(lastx, xs, d_lst, H);
     launch_rmsnorm(xb, lastx, d_w.norm, nseq, H, eps);
-    launch_lm_head(b_logits, xb, d_w.lm_head, nseq, VOC, H);
     /* Scatter each prompt's first token to its cache slot: b_tokens[slot] seeds the
      * decode loop and column 0 of the record is the first emitted token. */
     int *d_cslot = (int *)sbuf(B_PCSLOT, (size_t)nseq * sizeof(int));
     HIP_CHECK(hipMemcpyAsync(d_cslot, cslot, (size_t)nseq * sizeof(int), hipMemcpyHostToDevice, g_str));
     int *tokrec = (int *)sbuf(B_TOKREC, (size_t)g_batch * rec_stride * sizeof(int));
-    argmax_batched_kernel<<<nseq, 256, 0, g_str>>>(b_logits, VOC, VOC, b_tokens, d_cslot,
-                                         tokrec, rec_stride, 0, NULL, NULL, 0);
+    launch_lm_head_argmax(xb, d_w.lm_head, nseq, VOC, H, b_tokens, d_cslot, tokrec,
+                          rec_stride, 0, NULL, NULL, 0);
     /* The caller repacks the pf_* staging arrays for the next chunk, so the
      * async uploads issued above must be consumed before returning. */
     HIP_CHECK(hipStreamSynchronize(g_str));
@@ -475,7 +558,7 @@ static void device_forward_absorbed_batched(Transformer *t, int B, int nrec)
     const int VHD = c->v_head_dim, KVL = c->kv_lora_rank, KVD = KVL + QKR, VOC = c->vocab_size;
     const float scale = c->softmax_scale, eps = c->rms_eps;
     const int kv_stride = (QKN + VHD) * KVL;
-    const size_t layer_stride = (size_t)g_batch * g_cap * KVD;
+    const size_t layer_stride = (size_t)(g_kvslots + 1) * g_cap * KVD;   /* run67 */
     const int slot_stride = g_cap * KVD;
 
     embed_lookup_kernel<<<B, 256, 0, g_str>>>(b_x, d_w.embed_tokens, b_tokens, H);
@@ -483,9 +566,9 @@ static void device_forward_absorbed_batched(Transformer *t, int B, int nrec)
     for (int l = 0; l < c->n_layers; l++)
     {
         int8_t *kv_base = d_kv_cache + (size_t)l * layer_stride;
-        float  *kv_scale_base = d_kv_scale + (size_t)l * g_batch * g_cap;
+        float  *kv_scale_base = d_kv_scale + (size_t)l * (g_kvslots + 1) * g_cap;
 
-        launch_rmsnorm(b_xb, b_x, d_w.input_layernorm[l], B, H, eps);
+        if (l == 0) launch_rmsnorm(b_xb, b_x, d_w.input_layernorm[0], B, H, eps);
         launch_project_q(c, l, b_xb, b_q, B, b_qa);
         {
             dim3 grid(B, NH);
@@ -497,7 +580,8 @@ static void device_forward_absorbed_batched(Transformer *t, int B, int nrec)
         kv_write_batched_kernel<<<B, 256, (size_t)KVD * sizeof(float), g_str>>>(
                                             kv_base, kv_scale_base, slot_stride, b_pos, b_comp,
                                             d_w.kv_a_layernorm[l], KVL, QKR, KVD,
-                                            c->mla_norm_eps, d_inv_freq, c->rope_interleaved);
+                                            c->mla_norm_eps, d_inv_freq, c->rope_interleaved,
+                                            b_kvslot);
 
         /* qabs[s,h] = q_nope[s,h] @ W_UK[h]^T  (W_UK pre-transposed to [KVL,QKN]). */
         launch_matmul_bh(b_qabs, b_q, d_wuk_t[l], B, KVL, QKN,
@@ -514,27 +598,26 @@ static void device_forward_absorbed_batched(Transformer *t, int B, int nrec)
              * shape and this instruction mix -- it went from 531 to 104 ms per decode
              * step over runs 39-49, and the model dims it assumes are asserted in
              * warm_up. */
-            attn_fd_hb_q8_kernel<<<dim3(B, FD_HG), 256, 0, g_str>>>(b_clat, b_qabs, b_q, kv_base,
+            attn_fd_mfma_kernel<<<dim3(B, FD_HG), 256, 0, g_str>>>(b_clat, b_qabs, b_q, kv_base,
                                                           kv_scale_base, b_pos, NH, QHD, QKN, QKR,
-                                                          KVL, KVD, slot_stride, scale);
+                                                          KVL, KVD, slot_stride, scale, b_kvslot);
         }
         /* ctx[s,h] = clat[s,h] @ W_UV[h]^T. */
         launch_matmul_bh(b_ctx, b_clat, d_w.W_UV[l], B, VHD, KVL,
                          KVL, NH * KVL, kv_stride, VHD, NH * VHD, NH);
         launch_matmul_w8a8(b_ao, b_ctx, d_w.o_proj[l], dq_op?dq_op[l]:NULL, dq_op?ds_op[l]:NULL, B, H, NH * VHD);
-        launch_residual_add(b_x, b_ao, B * H);
-
-        launch_rmsnorm(b_xb, b_x, d_w.post_attn_norm[l], B, H, eps);
+        launch_residual_rmsnorm(b_x, b_xb, b_ao, d_w.post_attn_norm[l], B, H, eps);
         ffn_batched(c, l, b_xb, b_mo, B, b_hb, b_hb2);
-        launch_residual_add(b_x, b_mo, B * H);
+        /* Fuse with the norm that follows: the next layer's input norm, or the
+         * final norm after the last layer. */
+        launch_residual_rmsnorm(b_x, b_xb, b_mo,
+                                l + 1 < c->n_layers ? d_w.input_layernorm[l + 1] : d_w.norm,
+                                B, H, eps);
     }
 
-    launch_rmsnorm(b_xb, b_x, d_w.norm, B, H, eps);
-    launch_lm_head(b_logits, b_xb, d_w.lm_head, B, VOC, H);
-    /* The argmax also records this step's token and advances b_pos on-device, so
-     * the decode loop needs no host round-trip (see glm_inference). */
+
     int *tokrec = (int *)sbuf(B_TOKREC, (size_t)g_batch * nrec * sizeof(int));
-    argmax_batched_kernel<<<B, 256, 0, g_str>>>(b_logits, VOC, VOC, b_tokens, NULL,
-                                      tokrec, nrec, 0, b_step, b_pos, g_cap);
+    launch_lm_head_argmax(b_xb, d_w.lm_head, B, VOC, H, b_tokens, NULL, tokrec,
+                          nrec, 0, b_step, b_pos, g_cap);
     bump_step_kernel<<<1, 1, 0, g_str>>>(b_step);
 }

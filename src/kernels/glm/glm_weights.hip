@@ -57,12 +57,10 @@ static void device_malloc_model_weights(Transformer *t)
     {
         if (c->q_lora_rank > 0)
         {
-            device_malloc_and_copy((void **)&d_w.q_a_proj[l], w->q_a_proj[l],
-                                   (size_t)c->hidden_size * c->q_lora_rank * sizeof(bf16_t));
-            device_malloc_and_copy(
-                (void **)&d_w.q_b_proj[l], w->q_b_proj[l],
-                (size_t)c->q_lora_rank * c->n_heads *
-                    (c->qk_nope_head_dim + c->qk_rope_head_dim) * sizeof(bf16_t));
+            /* run65: q_a/q_b/kv_a/o_proj and the shared+dense FFN run int8 only, so
+             * their bf16 form is never uploaded either -- the int8 tables below
+             * stream it from the host mmap through the same staging buffer. */
+            d_w.q_a_proj[l] = d_w.q_b_proj[l] = NULL;
             device_malloc_and_copy((void **)&d_w.q_a_layernorm[l], w->q_a_layernorm[l],
                                    (size_t)c->q_lora_rank * sizeof(bf16_t));
             d_w.q_proj[l] = NULL;
@@ -76,17 +74,14 @@ static void device_malloc_model_weights(Transformer *t)
                     (c->qk_nope_head_dim + c->qk_rope_head_dim) * sizeof(bf16_t));
         }
 
-        device_malloc_and_copy((void **)&d_w.kv_a_proj[l], w->kv_a_proj[l],
-                               (size_t)c->hidden_size *
-                                   (c->kv_lora_rank + c->qk_rope_head_dim) * sizeof(bf16_t));
+        d_w.kv_a_proj[l] = NULL;
 
         device_malloc_and_copy((void **)&d_w.W_UK[l], w->W_UK[l],
                                (size_t)c->n_heads * c->kv_lora_rank *
                                    (c->qk_nope_head_dim + c->v_head_dim) * sizeof(bf16_t));
         d_w.W_UV[l] = d_w.W_UK[l] + (size_t)c->qk_nope_head_dim * c->kv_lora_rank;
 
-        device_malloc_and_copy((void **)&d_w.o_proj[l], w->o_proj[l],
-                               (size_t)c->n_heads * c->v_head_dim * c->hidden_size * sizeof(bf16_t));
+        d_w.o_proj[l] = NULL;
 
         device_malloc_and_copy((void **)&d_w.input_layernorm[l], w->input_layernorm[l],
                                (size_t)c->hidden_size * sizeof(bf16_t));
@@ -103,12 +98,7 @@ static void device_malloc_model_weights(Transformer *t)
 
         if (l < c->first_k_dense)
         {
-            device_malloc_and_copy((void **)&d_w.dense_gate[l], w->dense_gate[l],
-                                   (size_t)c->hidden_size * c->dense_inter_size * sizeof(bf16_t));
-            device_malloc_and_copy((void **)&d_w.dense_up[l], w->dense_up[l],
-                                   (size_t)c->hidden_size * c->dense_inter_size * sizeof(bf16_t));
-            device_malloc_and_copy((void **)&d_w.dense_down[l], w->dense_down[l],
-                                   (size_t)c->dense_inter_size * c->hidden_size * sizeof(bf16_t));
+            d_w.dense_gate[l] = d_w.dense_up[l] = d_w.dense_down[l] = NULL;
 
             d_w.moe_gate[l] = NULL;
             d_w.shared_gate[l] = d_w.shared_up[l] = d_w.shared_down[l] = NULL;
@@ -120,28 +110,11 @@ static void device_malloc_model_weights(Transformer *t)
         device_malloc_and_copy((void **)&d_w.moe_gate[l], w->moe_gate[l],
                                (size_t)c->hidden_size * c->n_routed_experts * sizeof(bf16_t));
 
-        device_malloc_and_copy((void **)&d_w.shared_gate[l], w->shared_gate[l],
-                               (size_t)c->hidden_size * c->n_shared_experts *
-                                   c->moe_inter_size * sizeof(bf16_t));
-        device_malloc_and_copy((void **)&d_w.shared_up[l], w->shared_up[l],
-                               (size_t)c->hidden_size * c->n_shared_experts *
-                                   c->moe_inter_size * sizeof(bf16_t));
-        device_malloc_and_copy((void **)&d_w.shared_down[l], w->shared_down[l],
-                               (size_t)c->n_shared_experts * c->moe_inter_size *
-                                   c->hidden_size * sizeof(bf16_t));
+        d_w.shared_gate[l] = d_w.shared_up[l] = d_w.shared_down[l] = NULL;
 
-        d_w.expert_gate[l] = (bf16_t **)malloc(c->n_routed_experts * sizeof(bf16_t *));
-        d_w.expert_up[l]   = (bf16_t **)malloc(c->n_routed_experts * sizeof(bf16_t *));
-        d_w.expert_down[l] = (bf16_t **)malloc(c->n_routed_experts * sizeof(bf16_t *));
-        for (int e = 0; e < c->n_routed_experts; e++)
-        {
-            device_malloc_and_copy((void **)&d_w.expert_gate[l][e], w->expert_gate[l][e],
-                                   (size_t)c->hidden_size * c->moe_inter_size * sizeof(bf16_t));
-            device_malloc_and_copy((void **)&d_w.expert_up[l][e], w->expert_up[l][e],
-                                   (size_t)c->hidden_size * c->moe_inter_size * sizeof(bf16_t));
-            device_malloc_and_copy((void **)&d_w.expert_down[l][e], w->expert_down[l][e],
-                                   (size_t)c->moe_inter_size * c->hidden_size * sizeof(bf16_t));
-        }
+        d_w.expert_gate[l] = (bf16_t **)calloc(c->n_routed_experts, sizeof(bf16_t *));
+        d_w.expert_up[l]   = (bf16_t **)calloc(c->n_routed_experts, sizeof(bf16_t *));
+        d_w.expert_down[l] = (bf16_t **)calloc(c->n_routed_experts, sizeof(bf16_t *));
     }
 }
 
@@ -246,30 +219,62 @@ static void free_moe_device_tables(Transformer *t)
     d_moe_bias = NULL;
 }
 
-/* Quantize one bf16 weight [rows][cols] (device) into a fresh int8 buffer + fp32
- * per-row scale buffer (device), then free the bf16 source. */
-static void quant_one_expert(bf16_t *src, int rows, int cols, int8_t **out_q, float **out_s)
+/* Quantize one bf16 weight [rows][cols] straight from the HOST mmap: copy into a
+ * staging buffer that is reused for every weight, then quantise out of it. The
+ * bf16 form is never resident twice, so the warm_up peak is the int8 result plus
+ * 6 MB instead of the whole 58 GB bf16 model.
+ *
+ * Ordering is the null stream's: hipMemcpy is blocking, so it cannot overwrite the
+ * staging buffer while the previous quantise kernel is still reading it. */
+static bf16_t *g_wstage = NULL;
+static size_t  g_wstage_elems = 0;
+
+static void vram_mark(const char *what)
 {
-    HIP_CHECK(hipMalloc((void **)out_q, (size_t)rows * cols * sizeof(int8_t)));
-    HIP_CHECK(hipMalloc((void **)out_s, (size_t)rows * sizeof(float)));
-    quantize_rows_i8_kernel<<<rows, 256>>>(src, *out_q, *out_s, rows, cols);
-    HIP_CHECK(hipFree(src));
+    size_t fr = 0, tot = 0;
+    HIP_CHECK(hipMemGetInfo(&fr, &tot));
+    fprintf(stderr, "[vram] %-28s used %6.2f GB / %.2f GB\n", what,
+            (double)(tot - fr) / (1024.0 * 1024.0 * 1024.0), (double)tot / (1024.0 * 1024.0 * 1024.0));
 }
 
-
-
-
-
-/* run20: quantize a bf16 weight [rows][cols] to int8 + per-row scale but KEEP the
- * bf16 (lm_head and moe_gate deliberately stay bf16). */
-static void quant_keep(const bf16_t *src, int rows, int cols, int8_t **out_q, float **out_s)
+static void stage_from_host(const bf16_t *hsrc, size_t n)
 {
-    HIP_CHECK(hipMalloc((void **)out_q, (size_t)rows * cols * sizeof(int8_t)));
-    HIP_CHECK(hipMalloc((void **)out_s, (size_t)rows * sizeof(float)));
-    quantize_rows_i8_kernel<<<rows, 256>>>(src, *out_q, *out_s, rows, cols);
+    if (n > g_wstage_elems) {
+        if (g_wstage) HIP_CHECK(hipFree(g_wstage));
+        HIP_CHECK(hipMalloc((void **)&g_wstage, n * sizeof(bf16_t)));
+        g_wstage_elems = n;
+    }
+    HIP_CHECK(hipMemcpy(g_wstage, (void *)hsrc, n * sizeof(bf16_t), hipMemcpyHostToDevice));
 }
 
+/* Quantise into a slab the caller already owns. Handing out offsets instead of
+ * calling hipMalloc per weight matters more than it looks: the expert tables are
+ * 8832 int8 buffers + 8832 tiny scale buffers, and when each is its own
+ * allocation the allocator's per-allocation granule pushed warm_up to 60 GB and
+ * OOM'd. (The old code got away with it only because it freed a 6 MB bf16 expert
+ * immediately before, so both allocations came back out of that same hole.) */
+static void quant_from_host_into(const bf16_t *hsrc, int rows, int cols,
+                                 int8_t *q_dst, float *s_dst)
+{
+    size_t n = (size_t)rows * cols;
+    stage_from_host(hsrc, n);
+    quantize_rows_i8_kernel<<<rows, 256>>>(g_wstage, q_dst, s_dst, rows, cols);
+}
 
+/* Same, for the handful of weights that are still one allocation each. */
+static void quant_from_host(const bf16_t *hsrc, int rows, int cols,
+                            int8_t **out_q, float **out_s)
+{
+    size_t n = (size_t)rows * cols;
+    HIP_CHECK(hipMalloc((void **)out_q, n * sizeof(int8_t)));
+    HIP_CHECK(hipMalloc((void **)out_s, (size_t)rows * sizeof(float)));
+    quant_from_host_into(hsrc, rows, cols, *out_q, *out_s);
+}
+
+static void free_wstage(void)
+{
+    if (g_wstage) { HIP_CHECK(hipFree(g_wstage)); g_wstage = NULL; g_wstage_elems = 0; }
+}
 
 /* ==== W8A8 / INT8 QUANTIZATION TABLES (GLM-tuned optimizations) ============ */
 
@@ -288,15 +293,14 @@ static void build_dense_int8_tables(Transformer *t)
     dq_op=(int8_t**)calloc(c->n_layers,sizeof(int8_t*)); ds_op=(float**)calloc(c->n_layers,sizeof(float*));
     /* run33: block-wise int4 (scale per K-group of 128) when g_dense_w4a8_bw; all
      * four projections' K (H, qlr=768, vdim=5120) are multiples of 128. */
-    void (*qk)(const bf16_t *, int, int, int8_t **, float **) =
-        quant_keep;
+    const ModelWeights *hw = &t->weights;
     for (int l = 0; l < c->n_layers; l++) {
         if (qlr > 0) {
-            qk(d_w.q_a_proj[l], qlr,   H,   &dq_qa[l], &ds_qa[l]);
-            qk(d_w.q_b_proj[l], q_dim, qlr, &dq_qb[l], &ds_qb[l]);
+            quant_from_host(hw->q_a_proj[l], qlr,   H,   &dq_qa[l], &ds_qa[l]);
+            quant_from_host(hw->q_b_proj[l], q_dim, qlr, &dq_qb[l], &ds_qb[l]);
         }
-        qk(d_w.kv_a_proj[l], KVD, H,    &dq_kva[l], &ds_kva[l]);
-        qk(d_w.o_proj[l],    H,   vdim, &dq_op[l],  &ds_op[l]);
+        quant_from_host(hw->kv_a_proj[l], KVD, H,    &dq_kva[l], &ds_kva[l]);
+        quant_from_host(hw->o_proj[l],    H,   vdim, &dq_op[l],  &ds_op[l]);
     }
     (void)KVD;
 }
@@ -315,15 +319,16 @@ static void build_ffn_int8_tables(Transformer *t)
     AZ(dq_dg); AZ(dq_du); AZ(dq_dd); FZ(ds_dg); FZ(ds_du); FZ(ds_dd);
     #undef AZ
     #undef FZ
+    const ModelWeights *hw = &t->weights;
     for (int l = 0; l < L; l++) {
         if (l < c->first_k_dense) {
-            quant_keep(d_w.dense_gate[l], DI, H,  &dq_dg[l], &ds_dg[l]);
-            quant_keep(d_w.dense_up[l],   DI, H,  &dq_du[l], &ds_du[l]);
-            quant_keep(d_w.dense_down[l], H,  DI, &dq_dd[l], &ds_dd[l]);
+            quant_from_host(hw->dense_gate[l], DI, H,  &dq_dg[l], &ds_dg[l]);
+            quant_from_host(hw->dense_up[l],   DI, H,  &dq_du[l], &ds_du[l]);
+            quant_from_host(hw->dense_down[l], H,  DI, &dq_dd[l], &ds_dd[l]);
         } else {
-            quant_keep(d_w.shared_gate[l], SI, H,  &dq_sg[l], &ds_sg[l]);
-            quant_keep(d_w.shared_up[l],   SI, H,  &dq_su[l], &ds_su[l]);
-            quant_keep(d_w.shared_down[l], H,  SI, &dq_sd[l], &ds_sd[l]);
+            quant_from_host(hw->shared_gate[l], SI, H,  &dq_sg[l], &ds_sg[l]);
+            quant_from_host(hw->shared_up[l],   SI, H,  &dq_su[l], &ds_su[l]);
+            quant_from_host(hw->shared_down[l], H,  SI, &dq_sd[l], &ds_sd[l]);
         }
     }
 }
@@ -344,6 +349,7 @@ static void build_moe_int8_tables(Transformer *t)
     AL(hs_g, float **,  c->n_layers); AL(hs_u, float **,  c->n_layers); AL(hs_d, float **,  c->n_layers);
     AL(d_epq_gate, int8_t **, c->n_layers); AL(d_epq_up, int8_t **, c->n_layers); AL(d_epq_down, int8_t **, c->n_layers);
     AL(d_eps_gate, float **,  c->n_layers); AL(d_eps_up, float **,  c->n_layers); AL(d_eps_down, float **,  c->n_layers);
+    AL(d_eslab_q, int8_t *, c->n_layers); AL(d_eslab_s, float *, c->n_layers);
     #undef AL
 
     for (int l = 0; l < c->n_layers; l++)
@@ -361,14 +367,26 @@ static void build_moe_int8_tables(Transformer *t)
         hs_g[l] = (float **)malloc(NR * sizeof(float *));
         hs_u[l] = (float **)malloc(NR * sizeof(float *));
         hs_d[l] = (float **)malloc(NR * sizeof(float *));
+        /* One int8 slab and one scale slab for the whole layer (604 MB + 1.3 MB);
+         * the per-expert pointers are offsets into them. */
+        const size_t emat = (size_t)I * H;                 /* elems per expert matrix */
+        int8_t *qslab; float *sslab;
+        HIP_CHECK(hipMalloc((void **)&qslab, (size_t)NR * 3 * emat));
+        HIP_CHECK(hipMalloc((void **)&sslab, (size_t)NR * (2 * I + H) * sizeof(float)));
+        d_eslab_q[l] = qslab; d_eslab_s[l] = sslab;
+        if ((l % 8) == 0) { char b[64]; snprintf(b, sizeof b, "moe int8 layer %d", l); vram_mark(b); }
+        const ModelWeights *hw = &t->weights;
         for (int e = 0; e < NR; e++)
         {
-            void (*qexp)(bf16_t *, int, int, int8_t **, float **) =
-                quant_one_expert;
-            qexp(d_w.expert_gate[l][e], I, H, &hq_g[l][e], &hs_g[l][e]);
-            qexp(d_w.expert_up[l][e],   I, H, &hq_u[l][e], &hs_u[l][e]);
-            qexp(d_w.expert_down[l][e], H, I, &hq_d[l][e], &hs_d[l][e]);
-            d_w.expert_gate[l][e] = d_w.expert_up[l][e] = d_w.expert_down[l][e] = NULL;
+            hq_g[l][e] = qslab + ((size_t)e * 3 + 0) * emat;
+            hq_u[l][e] = qslab + ((size_t)e * 3 + 1) * emat;
+            hq_d[l][e] = qslab + ((size_t)e * 3 + 2) * emat;
+            hs_g[l][e] = sslab + (size_t)e * (2 * I + H);
+            hs_u[l][e] = hs_g[l][e] + I;
+            hs_d[l][e] = hs_g[l][e] + 2 * I;
+            quant_from_host_into(hw->expert_gate[l][e], I, H, hq_g[l][e], hs_g[l][e]);
+            quant_from_host_into(hw->expert_up[l][e],   I, H, hq_u[l][e], hs_u[l][e]);
+            quant_from_host_into(hw->expert_down[l][e], H, I, hq_d[l][e], hs_d[l][e]);
         }
         /* Upload per-expert pointer arrays to device tables (kernel indexes by e). */
         device_malloc_and_copy((void **)&d_epq_gate[l], hq_g[l], (size_t)NR * sizeof(int8_t *));
@@ -385,15 +403,10 @@ static void free_moe_int8_tables(Transformer *t)
 {
     Config *c = &t->config;
     if (!hq_g) return;
-    const int NR = c->n_routed_experts;
     for (int l = c->first_k_dense; l < c->n_layers; l++)
     {
         if (!hq_g[l]) continue;
-        for (int e = 0; e < NR; e++)
-        {
-            HIP_CHECK(hipFree(hq_g[l][e])); HIP_CHECK(hipFree(hq_u[l][e])); HIP_CHECK(hipFree(hq_d[l][e]));
-            HIP_CHECK(hipFree(hs_g[l][e])); HIP_CHECK(hipFree(hs_u[l][e])); HIP_CHECK(hipFree(hs_d[l][e]));
-        }
+        HIP_CHECK(hipFree(d_eslab_q[l])); HIP_CHECK(hipFree(d_eslab_s[l]));
         HIP_CHECK(hipFree(d_epq_gate[l])); HIP_CHECK(hipFree(d_epq_up[l])); HIP_CHECK(hipFree(d_epq_down[l]));
         HIP_CHECK(hipFree(d_eps_gate[l])); HIP_CHECK(hipFree(d_eps_up[l])); HIP_CHECK(hipFree(d_eps_down[l]));
         free(hq_g[l]); free(hq_u[l]); free(hq_d[l]); free(hs_g[l]); free(hs_u[l]); free(hs_d[l]);

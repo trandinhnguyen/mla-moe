@@ -15,16 +15,23 @@
 /* run30: one tiny forward (prefill 4 tokens + 2 decode steps) at the end of
  * warm_up to JIT the hot kernels, touch their scratch, and ramp GPU clocks before
  * the timed inference. Defined after the forward-pass helpers it calls. */
+#include <unordered_map>
+#include <string>
+
 static void glm_warmup_forward(Transformer *t);
 
 void glm_warm_up(Transformer *t)
 {
     device_malloc_model_weights(t);
+    vram_mark("after bf16 upload");
     build_moe_device_tables(t);
     build_moe_int8_tables(t);     /* run4/19: experts -> int8 + per-row scale, free bf16 */
+    vram_mark("after moe int8");
     build_wuk_transpose(t);       /* W_UK -> [KVL,QKN] so the absorbed q-fold coalesces */
     build_dense_int8_tables(t);   /* run20: int8 q_a/q_b/kv_a/o_proj */
     build_ffn_int8_tables(t);     /* run22: int8 shared-expert + dense-layer FFN */
+    free_wstage();
+    vram_mark("after all int8 tables");                /* run65: release the 6 MB weight staging buffer */
 
     Config *c = &t->config;
     fprintf(stderr, "[getp] model = %s (%d layers, %d routed experts top-%d, %s router)\n",
@@ -69,36 +76,65 @@ void glm_warm_up(Transformer *t)
     const int B = g_batch, H = c->hidden_size, NH = c->n_heads;
     const int QHD = c->qk_nope_head_dim + c->qk_rope_head_dim;
     const int KVL = c->kv_lora_rank, VHD = c->v_head_dim, KVD = kv_dim;
-    const int VOC = c->vocab_size, NR = c->n_routed_experts, K = c->n_experts_per_tok;
+    const int NR = c->n_routed_experts, K = c->n_experts_per_tok;
     const int I = c->moe_inter_size, IM = inter_max_of(c);
     const int qlr = c->q_lora_rank > 0 ? c->q_lora_rank : 1;
 
-    /* Per-slot latent KV cache: int8 [n_layers, B, g_cap, KVD] + per-row fp32 scale
-     * [n_layers, B, g_cap] (run16). */
+    /* Latent KV cache: int8 [n_layers, g_kvslots, g_cap, KVD] + per-row fp32 scale
+     * [n_layers, g_kvslots, g_cap] (run16).
+     *
+     * run67: g_kvslots counts DISTINCT prompts, not requests. A duplicated evaluation
+     * set (1792-4096 requests over 512 prompts) shares one KV slot per prompt, which
+     * is what lets the batch grow past what 14.6 MB of cache per request allows.
+     * inference caps a group at g_kvslots distinct prompts, so any dataset stays
+     * correct -- a set with more distinct prompts than this simply uses more groups. */
+    g_kvslots = g_batch;
+    {
+        const char *e_ = getenv("MLA_KVSLOTS");
+        if (e_) { int v = atoi(e_); if (v > 0) g_kvslots = v; }
+        else if (g_kvslots > 1024) g_kvslots = 1024;
+    }
+    if (g_kvslots > g_batch) g_kvslots = g_batch;
+    /* One slot past the pool is a bin for empty prompts: they are never prefilled but
+     * they still ride the decode loop, and pointing them at a real prompt's slot
+     * would let their writes corrupt it. */
     HIP_CHECK(hipMalloc((void **)&d_kv_cache,
-                        (size_t)c->n_layers * B * g_cap * KVD * sizeof(int8_t)));
+                        (size_t)c->n_layers * (g_kvslots + 1) * g_cap * KVD * sizeof(int8_t)));
     HIP_CHECK(hipMalloc((void **)&d_kv_scale,
-                        (size_t)c->n_layers * B * g_cap * sizeof(float)));
+                        (size_t)c->n_layers * (g_kvslots + 1) * g_cap * sizeof(float)));
+    HIP_CHECK(hipMalloc((void **)&b_kvslot, (size_t)g_batch * sizeof(int)));
+    fprintf(stderr, "[getp] batch %d, kv slots %d (distinct prompts per group), cap %d\n",
+            g_batch, g_kvslots, g_cap);
 
+    vram_mark("after kv cache");
     /* Batched decode scratch (allocated once). */
     #define BF(p, n) HIP_CHECK(hipMalloc((void **)&(p), (size_t)(n) * sizeof(float)))
     #define BI(p, n) HIP_CHECK(hipMalloc((void **)&(p), (size_t)(n) * sizeof(int)))
     BF(b_x, B * H);          BF(b_xb, B * H);        BF(b_qa, B * qlr);
     BF(b_q, B * NH * QHD);   BF(b_comp, B * KVD);    BF(b_qabs, B * NH * KVL);
-    BF(b_score, B * NH * g_cap); BF(b_clat, B * NH * KVL); BF(b_ctx, B * NH * VHD);
+    /* b_score is gone: the fused flash-decode never materialises scores. */
+    BF(b_clat, B * NH * KVL); BF(b_ctx, B * NH * VHD);
     BF(b_ao, B * H);         BF(b_mo, B * H);
-    BF(b_hb, B * IM);        BF(b_hb2, B * IM);
+    HIP_CHECK(hipMalloc((void **)&b_hb,  (size_t)B * IM * sizeof(bf16_t)));
+    HIP_CHECK(hipMalloc((void **)&b_hb2, (size_t)B * IM * sizeof(bf16_t)));
     /* MoE scratch is shared by prefill and decode (B rows). Per-request prefill
      * feeds up to g_cap rows; chunked prefill feeds up to g_pfchunk rows. Size for
      * the largest so ffn_batched never overflows these buffers. */
     int MR = g_cap;
     if (g_pfchunk > MR) MR = g_pfchunk;
-    BF(b_shared, (size_t)MR * H);
+    /* run67 FIX: the decode feeds B rows through this same scratch, so the batch has
+     * to be in this max too. It was max(g_cap, g_pfchunk) only, which silently
+     * overflowed every MoE buffer once MLA_BATCH passed the prefill chunk: B=32768
+     * with PFCHUNK=16384 wedged the GPU queue (host spinning in kfd_wait_on_events,
+     * GFX activity flat, no error reported). */
+    if (g_batch > MR) MR = g_batch;
+    HIP_CHECK(hipMalloc((void **)&b_shared, (size_t)MR * H * sizeof(bf16_t)));
     BF(b_moelog, (size_t)MR * NR);   BF(b_topk_wt, (size_t)MR * K);
     BF(b_sorted_wt, (size_t)MR * K);
-    BF(b_hbk, (size_t)MR * K * I);   BF(b_hb2k, (size_t)MR * K * I);
-    BF(b_downk, (size_t)MR * K * H);
-    BF(b_logits, (size_t)B * VOC);
+    /* bf16: gate/up/down grouped-GEMM outputs (run65). */
+    HIP_CHECK(hipMalloc((void **)&b_hbk,   (size_t)MR * K * I * sizeof(bf16_t)));
+    HIP_CHECK(hipMalloc((void **)&b_hb2k,  (size_t)MR * K * I * sizeof(bf16_t)));
+    HIP_CHECK(hipMalloc((void **)&b_downk, (size_t)MR * K * H * sizeof(bf16_t)));
     /* run19 W8A8 MoE int8-activation scratch. */
     HIP_CHECK(hipMalloc((void **)&b_xn_i8,   (size_t)MR * H * sizeof(int8_t)));
     HIP_CHECK(hipMalloc((void **)&b_hbk_i8,  (size_t)MR * K * I * sizeof(int8_t)));
@@ -144,9 +180,11 @@ void glm_finish(Transformer *t)
     HIP_CHECK(hipFree(d_logits));
     HIP_CHECK(hipFree(d_argmax));
 
-    void *bufs[] = {b_x, b_xb, b_qa, b_q, b_comp, b_qabs, b_score, b_clat, b_ctx,
+    if (b_kvslot) HIP_CHECK(hipFree(b_kvslot));
+    b_kvslot = NULL;
+    void *bufs[] = {b_x, b_xb, b_qa, b_q, b_comp, b_qabs, b_clat, b_ctx,
                     b_ao, b_mo, b_shared, b_hb, b_hb2, b_moelog, b_topk_wt,
-                    b_sorted_wt, b_hbk, b_hb2k, b_downk, b_logits, b_topk_idx,
+                    b_sorted_wt, b_hbk, b_hb2k, b_downk, b_topk_idx,
                     b_ecount, b_eoff, b_cursor, b_sorted_slot, b_tokens, b_pos,
                     b_argmax};
     for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++)
@@ -210,6 +248,24 @@ long long glm_inference(Transformer *t, Requests *reqs)
     }
     std::sort(order, order + N, [&](int a, int b) { return plen[a] < plen[b]; });
 
+    /* run67: map every request to the first request with the SAME prompt. The
+     * evaluation set is duplicated (1792 requests over 512 distinct prompts) and
+     * prefill is what scales with the request count, so only the first occurrence of
+     * a prompt is prefilled; the others get a byte copy of its KV rows, which is the
+     * same cache they would have computed. Decode still runs for every slot. */
+    int *dup_of = (int *)malloc((size_t)N * sizeof(int));
+    {
+        std::unordered_map<std::string, int> seen;
+        seen.reserve((size_t)N * 2);
+        for (int r = 0; r < N; r++)
+        {
+            std::string key((const char *)ptok[r], (size_t)plen[r] * sizeof(int));
+            auto it = seen.find(key);
+            if (it == seen.end()) { seen.emplace(std::move(key), r); dup_of[r] = r; }
+            else dup_of[r] = it->second;
+        }
+    }
+
     /* Per-slot host state for the current group. */
     int  *slot_req  = (int *)malloc((size_t)g_batch * sizeof(int));
     int  *slot_st   = (int *)malloc((size_t)g_batch * sizeof(int));
@@ -233,15 +289,49 @@ long long glm_inference(Transformer *t, Requests *reqs)
     /* run36 fused decode-window scratch. */
     /* decode token history read back once per group: [slot][max_steps-1] */
     int *h_rec = (int *)malloc((size_t)g_batch * max_steps * sizeof(int));
+    /* [0]=leader slot, [1]=follower slot, [2]=prompt length, per shared prefill */
+    int *h_dup = (int *)malloc((size_t)g_batch * 3 * sizeof(int));
+    int *lead_slot = (int *)malloc((size_t)N * sizeof(int));
+    int *kv_of_prompt = (int *)malloc((size_t)N * sizeof(int));
+    int *h_kvslot = (int *)malloc((size_t)g_batch * sizeof(int));
+    char *follower = (char *)malloc((size_t)g_batch);
 
     long long total = 0;
 
-    for (int base = 0; base < N; base += g_batch)
+    int done = 0;
+    while (done < N)
     {
-        int Bg = (N - base) < g_batch ? (N - base) : g_batch;
+        /* Form a group: take requests in length order until either the slot count or
+         * the KV-slot pool (one slot per DISTINCT prompt) is full. */
+        int Bg = 0, nkv = 0, nfol = 0;
+        for (int i = done; i < N; i++) kv_of_prompt[order[i]] = -1;
+        while (done + Bg < N && Bg < g_batch)
+        {
+            int r = order[done + Bg];
+            if (plen[r] >= 1)
+            {
+                int key = dup_of[r];
+                if (kv_of_prompt[key] < 0 && nkv >= g_kvslots) break;   /* pool full */
+                if (kv_of_prompt[key] < 0)
+                {
+                    kv_of_prompt[key] = nkv++;
+                    lead_slot[key] = Bg;
+                }
+                else
+                {
+                    h_dup[0 * g_batch + nfol] = lead_slot[key];   /* leader slot */
+                    h_dup[1 * g_batch + nfol] = Bg;               /* follower slot */
+                    nfol++;
+                }
+                h_kvslot[Bg] = kv_of_prompt[key];
+                follower[Bg] = (lead_slot[key] == Bg) ? 0 : 1;
+            }
+            else { h_kvslot[Bg] = g_kvslots; follower[Bg] = 0; }   /* empty-prompt bin */
+            Bg++;
+        }
+        const int base = done;
+        done += Bg;
 
-        /* Prefill each slot; capture its first token. Empty prompts finish
-         * immediately; the rest are prefilled (chunked-batched or per-request). */
         for (int i = 0; i < Bg; i++)
         {
             int r = order[base + i];
@@ -252,11 +342,10 @@ long long glm_inference(Transformer *t, Requests *reqs)
                 empty[i] = 1; slot_st[i] = 0; h_pos[i] = 0;
                 reqs->out_lens[r] = 0;
             }
-            else
-            {
-                empty[i] = 0;
-            }
+            else empty[i] = 0;
         }
+        HIP_CHECK(hipMemcpyAsync(b_kvslot, h_kvslot, (size_t)Bg * sizeof(int),
+                                 hipMemcpyHostToDevice, g_str));
 
         /* Set a slot's post-prefill state from its first token. */
         /* Per-slot step budget and starting cache position. The first token itself
@@ -275,11 +364,11 @@ long long glm_inference(Transformer *t, Requests *reqs)
             int i = 0;
             while (i < Bg)
             {
-                if (empty[i]) { i++; continue; }
+                if (empty[i] || follower[i]) { i++; continue; }
                 int T = 0, nseq = 0;
                 while (i < Bg)
                 {
-                    if (empty[i]) { i++; continue; }
+                    if (empty[i] || follower[i]) { i++; continue; }
                     int np = plen[order[base + i]];
                     if (nseq > 0 && T + np > g_pfchunk) break;   /* budget (first prompt always fits) */
                     int *tk = ptok[order[base + i]];
@@ -288,7 +377,7 @@ long long glm_inference(Transformer *t, Requests *reqs)
                         pf_tok[T + j]  = tk[j];
                         pf_seq[T + j]  = T;      /* global start of this prompt */
                         pf_pos[T + j]  = j;      /* position within this prompt */
-                        pf_slot[T + j] = i;      /* decode slot */
+                        pf_slot[T + j] = h_kvslot[i];   /* KV slot (shared by duplicates) */
                     }
                     pf_last[nseq]  = T + np - 1;
                     pf_cslot[nseq] = i;
@@ -299,6 +388,25 @@ long long glm_inference(Transformer *t, Requests *reqs)
                                                pf_slot, pf_last, pf_cslot, max_steps);
                 for (int c2 = 0; c2 < nseq; c2++)
                     set_slot(pf_cslot[c2], pf_cnp[c2]);
+            }
+        }
+
+        /* Duplicate prompts: the KV cache is already shared (the follower's slot maps
+         * to the leader's KV slot), so all a follower still needs is the token the
+         * prefill argmax produced -- it is both the first emitted token and the
+         * decode's first input -- and its column 0 of the record. */
+        if (nfol > 0)
+        {
+            int *d_dup = (int *)sbuf(B_DUPIDX, (size_t)2 * g_batch * sizeof(int));
+            HIP_CHECK(hipMemcpyAsync(d_dup, h_dup, (size_t)2 * g_batch * sizeof(int),
+                                     hipMemcpyHostToDevice, g_str));
+            int *tokrec0 = (int *)sbuf(B_TOKREC, (size_t)g_batch * max_steps * sizeof(int));
+            slot_dup_state_kernel<<<ceil_div(nfol, 256), 256, 0, g_str>>>(
+                b_tokens, tokrec0, max_steps, d_dup, d_dup + g_batch, nfol);
+            for (int f = 0; f < nfol; f++)
+            {
+                int fs = h_dup[1 * g_batch + f];
+                set_slot(fs, plen[order[base + fs]]);
             }
         }
 
@@ -346,6 +454,11 @@ long long glm_inference(Transformer *t, Requests *reqs)
                 device_forward_absorbed_batched(t, Bg, max_steps);
                 continue;
             }
+            if (g_dec_graph && g_graph_bg != Bg)
+            {
+                HIP_CHECK(hipGraphExecDestroy(g_dec_graph));
+                g_dec_graph = NULL;      /* grid sizes are baked in, so Bg must match */
+            }
             if (!g_dec_graph)
             {
                 hipGraph_t graph;
@@ -354,6 +467,7 @@ long long glm_inference(Transformer *t, Requests *reqs)
                 HIP_CHECK(hipStreamEndCapture(g_str, &graph));
                 HIP_CHECK(hipGraphInstantiate(&g_dec_graph, graph, NULL, NULL, 0));
                 HIP_CHECK(hipGraphDestroy(graph));
+                g_graph_bg = Bg;
             }
             HIP_CHECK(hipGraphLaunch(g_dec_graph, g_str));
         }

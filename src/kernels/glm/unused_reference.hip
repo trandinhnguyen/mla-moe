@@ -3025,3 +3025,643 @@ __global__ void weighted_add_kernel(float *out, const float *add, float weight,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] += weight * add[i];
 }
+
+
+/* ======================================================================== *
+ * Retired: the per-head shared-X GEMM now always runs the 128-tile bf16-in/bf16-out
+ * variant (run64). This fp32 version is kept for reference only.
+ * ======================================================================== */
+/* run45: prefetched twin of matmul_headw_mfma_kernel. Same tiles / K order /
+ * MFMA calls (BIT-IDENTICAL); the K-loop keeps two LDS tile buffers and issues
+ * the next tile's global loads before the MFMAs so the ~800-cycle miss is
+ * covered -- the same lever that took the two hot int8 GEMMs from 982 to 1210
+ * tok/s. This kernel is 4.0 s of prefill (per-head W_UK/W_UV materialisation).
+ * of prefill (per-head W_UK/W_UV materialisation). */
+__global__ void matmul_headw_mfma_pf_kernel(float *Y, const float *X, const bf16_t *W,
+                                            int M, int N, int K, int x_stride,
+                                            int w_hstride, int y_hstride) {
+    int h = blockIdx.z;
+    const bf16_t *Wh = W + (size_t)h * w_hstride;
+    float        *Yh = Y + (size_t)h * y_hstride;
+
+    __shared__ __bf16 As[2][TBK][TBM + 4];
+    __shared__ __bf16 Bs[2][TBK][TBN + 4];
+    int tx = threadIdx.x;
+    int warp = tx / 64, tiw = tx % 64;
+    int srow = (warp / 2) * 32, scol = (warp % 2) * 32;
+    int trow = tiw / 16, tcol = tiw % 16;
+    int row0 = blockIdx.y * TBM, col0 = blockIdx.x * TBN;
+    const int am = tx / 4, acc4 = (tx % 4) * 4;          /* A: 64 rows x 4 k-quads */
+    const int bn = tx / (TBK / 8), bcc = (tx % (TBK / 8)) * 8;  /* B: 8 bf16 each   */
+    const int bact = (tx < TBN * TBK / 8);
+
+    float4 va; uint16_t wb[8];
+    auto loadA = [&](int k0) {
+        va = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (row0 + am < M) va = *reinterpret_cast<const float4 *>(&X[(size_t)(row0 + am) * x_stride + k0 + acc4]);
+    };
+    auto loadB = [&](int k0) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) wb[j] = 0;
+        if (bact && col0 + bn < N)
+            __builtin_memcpy(wb, &Wh[(size_t)(col0 + bn) * K + k0 + bcc], 8 * sizeof(uint16_t));
+    };
+    auto store = [&](int buf) {
+        As[buf][acc4 + 0][am] = (__bf16)va.x; As[buf][acc4 + 1][am] = (__bf16)va.y;
+        As[buf][acc4 + 2][am] = (__bf16)va.z; As[buf][acc4 + 3][am] = (__bf16)va.w;
+        if (bact)
+#pragma unroll
+            for (int j = 0; j < 8; j++) Bs[buf][bcc + j][bn] = *reinterpret_cast<const __bf16 *>(&wb[j]);
+    };
+
+    loadA(0); loadB(0); store(0);
+    __syncthreads();
+
+    float4v acc[2][2] = {};
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += TBK, buf ^= 1) {
+        const int kn = k0 + TBK;
+        if (kn < K) { loadA(kn); loadB(kn); }
+        bf16x4 a[2], b[2];
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) a[i][e] = As[buf][trow * 4 + e][srow + i * 16 + tcol];
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) b[j][e] = Bs[buf][trow * 4 + e][scol + j * 16 + tcol];
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+                acc[i][j] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a[i], b[j], acc[i][j], 0, 0, 0);
+        if (kn < K) store(buf ^ 1);
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        int base_row = row0 + srow + i * 16 + trow * 4;
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int col = col0 + scol + j * 16 + tcol;
+            if (col >= N) continue;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int row = base_row + e;
+                if (row < M) Yh[(size_t)row * N + col] = acc[i][j][e];
+            }
+        }
+    }
+}
+
+/* ======================================================================== *
+ * Retired (run65): plain bf16 lm_head. Superseded by
+ * matmul_mfma_128_xbf_argmax_kernel + launch_lm_head_argmax, which folds the
+ * argmax into the GEMM epilogue so the [rows][154880] logits buffer (714 MB, more
+ * than the whole remaining VRAM headroom) is never materialised. Its last caller
+ * was the prefill first-token head: 26 launches, 363 ms, 1.0% of kernel time.
+ * ======================================================================== */
+static void launch_lm_head(float *Y, const float *X, const bf16_t *W,
+                           int n_rows, int d_out, int n_in)
+{
+    int b128 = ceil_div(d_out, 128) * ceil_div(n_rows, 128);
+    if (n_rows >= 128 && d_out >= 128 && b128 >= 96) {
+        bf16_t *xbf = (bf16_t *)sbuf(B_XBF16, (size_t)n_rows * n_in * sizeof(bf16_t));
+        int n = n_rows * n_in;
+        narrow_bf16_kernel<<<ceil_div(n, 256), 256, 0, g_str>>>(xbf, X, n);
+        dim3 grid(ceil_div(d_out, 128), ceil_div(n_rows, 128));
+        matmul_mfma_128_xbf_kernel<<<grid, 256, 0, g_str>>>(Y, xbf, W, n_rows, d_out,
+                                                           n_in, n_in, d_out);
+    } else {
+        launch_matmul(Y, X, W, n_rows, d_out, n_in);
+    }
+}
+
+__global__ void matmul_mfma_128_xbf_kernel(float *Y, const bf16_t *X, const bf16_t *W,
+                                           int M, int N, int K, int x_stride,
+                                           int y_stride) {
+    __shared__ __bf16 As[TBK][TBM2 + 4];
+    __shared__ __bf16 Bs[TBK][TBN2 + 4];
+    int tx = threadIdx.x;
+    int warp = tx / 64, tiw = tx % 64;
+    int srow = (warp / 2) * 64, scol = (warp % 2) * 64;
+    int trow = tiw / 16, tcol = tiw % 16;
+    int row0 = blockIdx.y * TBM2, col0 = blockIdx.x * TBN2;
+
+    float4v acc[4][4] = {};
+    for (int k0 = 0; k0 < K; k0 += TBK) {
+#pragma unroll
+        for (int r = 0; r < TBM2; r += 64) {
+            int m = r + tx / 4, cc = (tx % 4) * 4, gr = row0 + m;
+            uint16_t xb[4] = {0, 0, 0, 0};
+            if (gr < M) __builtin_memcpy(xb, &X[(size_t)gr * x_stride + k0 + cc], 4 * sizeof(uint16_t));
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+                As[cc + j][m] = (gr < M) ? *reinterpret_cast<const __bf16 *>(&xb[j]) : (__bf16)0.0f;
+        }
+        {
+            int n = tx / (TBK / 8), cc = (tx % (TBK / 8)) * 8, gr = col0 + n;
+            uint16_t wb[8] = {0};
+            if (gr < N) __builtin_memcpy(wb, &W[(size_t)gr * K + k0 + cc], 8 * sizeof(uint16_t));
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                Bs[cc + j][n] = (gr < N) ? *reinterpret_cast<const __bf16 *>(&wb[j]) : (__bf16)0.0f;
+        }
+        __syncthreads();
+        bf16x4 a[4], b[4];
+#pragma unroll
+        for (int i2 = 0; i2 < 4; i2++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) a[i2][e] = As[trow * 4 + e][srow + i2 * 16 + tcol];
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) b[j][e] = Bs[trow * 4 + e][scol + j * 16 + tcol];
+#pragma unroll
+        for (int i2 = 0; i2 < 4; i2++)
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+                acc[i2][j] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a[i2], b[j], acc[i2][j], 0, 0, 0);
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i2 = 0; i2 < 4; i2++) {
+        int base_row = row0 + srow + i2 * 16 + trow * 4;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int col = col0 + scol + j * 16 + tcol;
+            if (col >= N) continue;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int row = base_row + e;
+                if (row < M) Y[(size_t)row * y_stride + col] = acc[i2][j][e];
+            }
+        }
+    }
+}
+
+
+/* ======================================================================== *
+ * Retired (run65): the 32-query-tile prefill attention. MEASURED, do not retry.
+ *
+ * The counter data said the 64-query kernel is latency-bound (MFMA 4.9%, VALU
+ * 18.3%, LDS BW 7.1%, occupancy 18.8%, IPC 0.30) and that its register floor --
+ * O[64][256] over 256 threads = 64 accumulators per lane, 149 VGPRs -- was the one
+ * thing pinning it at 3 waves/SIMD. This halves that floor: 80 VGPRs and LDS 13.8
+ * -> 8.1 KB, i.e. 4 waves/SIMD with no spill (5 waves needs 102 regs and spills 32
+ * B/lane; the launch_bounds sweep is in the report).
+ *
+ * It got the occupancy and still LOST: 1608.4 vs 1620.5 tok/s (-0.75%) at
+ * B=1152/dup2q/PFCHUNK=16384, same binary, same GPU, toggled by env. Total MFMA and
+ * softmax work is identical -- what doubles is the number of (query-tile, key-tile)
+ * pairs, hence the barrier count, and two extra barriers per key tile cost more
+ * than the extra resident wave buys. The conclusion for this kernel is therefore
+ * that BARRIERS, not occupancy, are what is left to attack.
+ *
+ * Output was bit-identical to the 64-query version (verified by cmp on the full
+ * 1152-request run), which also confirms the tiling rewrite is correct: the extra
+ * fully-masked key tiles the 64-query version processes contribute exactly zero.
+ * ======================================================================== */
+/* ======================================================================== *
+ *  32-QUERY-TILE prefill attention.
+ *
+ *  rocprof-compute on the 64-query version: nothing saturated (MFMA 4.9%, VALU
+ *  18.3%, LDS BW 7.1%), occupancy 18.8%, IPC 0.30 -- latency-bound, wanting
+ *  resident waves. Its LDS was reduced to 13.8 KB (4 blocks/CU) but occupancy did
+ *  not move, because the register floor took over: O[64][256] spread over 256
+ *  threads is 64 registers per lane, and 512/149 caps the kernel at 3 waves/SIMD.
+ *
+ *  Halving the query tile halves that floor. min-waves 4 is the most the register
+ *  budget allows without spilling (5 waves = 102 regs = 32 B/lane of scratch). Per block: S[32][64], O[32][256] =
+ *  32 registers of accumulator, Psh 4 KB, LDS ~8 KB. Warp grid is 2x2 over
+ *  (16 rows) x (32 cols), so each warp holds 1 m-tile x 2 n-tiles instead of 2x2.
+ *  Twice as many blocks, each doing half the work: total MFMA and softmax work is
+ *  unchanged, only the barrier count doubles -- which is the trade being measured.
+ * ======================================================================== */
+__global__ __launch_bounds__(256, 4) void attn_prefill_mfma_q32_kernel(
+        float *ctx, const float *qall, const bf16_t *knope, const float *kv_l,
+        const bf16_t *value, const int *qt_q0, const int *qt_qs, const int *qt_qe,
+        int n_tok, int NH, int QHD, int QKN, int QKR, int KVD, int KVL, int VHD,
+        float scale) {
+    const int qt = blockIdx.x, h = blockIdx.y, tx = threadIdx.x;
+    const int warp = tx / 64, tiw = tx % 64;
+    const int srow = (warp / 2) * 16, scol = (warp % 2) * 32;
+    const int trow = tiw / 16, tcol = tiw % 16;
+    (void)QKR;
+
+    const int q0 = qt_q0[qt], qs = qt_qs[qt], qe = qt_qe[qt];
+    const bf16_t *knope_h = knope + (size_t)h * n_tok * QKN;
+    const bf16_t *value_h = value + (size_t)h * n_tok * VHD;
+
+    __shared__ __bf16 Psh[32][64];
+    __shared__ __bf16 As[16][32];
+    __shared__ __bf16 Bs[16][64];
+    __shared__ float  m_[32], l_[32], corr_[32];
+    __shared__ float  rmax[2][32], rsum[2][32];
+
+    if (tx < 32) { m_[tx] = -INFINITY; l_[tx] = 0.0f; }
+    float4va oacc[4][2] = {};
+    __syncthreads();
+
+    const int kmax = (q0 + 31 < qe - 1) ? (q0 + 31) : (qe - 1);
+    const int chalf = scol / 32;
+
+    for (int kt0 = qs; kt0 <= kmax; kt0 += 64) {
+        float4va sacc[2] = {};
+        for (int k0 = 0; k0 < QHD; k0 += 16) {
+            if (tx < 128) {          /* A tile: 32 queries x 16 k, 4 floats/lane */
+                int m = tx / 4, cc = (tx % 4) * 4, g = q0 + m;
+                float4 v = {0.f, 0.f, 0.f, 0.f};
+                if (g < qe) v = *reinterpret_cast<const float4 *>(
+                                    &qall[((size_t)g * NH + h) * QHD + k0 + cc]);
+                As[cc + 0][m] = (__bf16)v.x; As[cc + 1][m] = (__bf16)v.y;
+                As[cc + 2][m] = (__bf16)v.z; As[cc + 3][m] = (__bf16)v.w;
+            }
+            {                        /* B tile: 64 keys x 16 k */
+                int n = tx / 4, cc = (tx % 4) * 4, kg = kt0 + n;
+                if (kg < qe && k0 < QKN) {
+                    uint16_t kb[4];
+                    __builtin_memcpy(kb, &knope_h[(size_t)kg * QKN + k0 + cc], 4 * sizeof(uint16_t));
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        Bs[cc + j][n] = *reinterpret_cast<const __bf16 *>(&kb[j]);
+                } else {
+                    float4 v = {0.f, 0.f, 0.f, 0.f};
+                    if (kg < qe)
+                        v = *reinterpret_cast<const float4 *>(&kv_l[(size_t)kg * KVD + KVL + (k0 - QKN) + cc]);
+                    Bs[cc + 0][n] = (__bf16)v.x; Bs[cc + 1][n] = (__bf16)v.y;
+                    Bs[cc + 2][n] = (__bf16)v.z; Bs[cc + 3][n] = (__bf16)v.w;
+                }
+            }
+            __syncthreads();
+            bf16x4a a, b[2];
+#pragma unroll
+            for (int e = 0; e < 4; e++) a[e] = As[trow * 4 + e][srow + tcol];
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) b[j][e] = Bs[trow * 4 + e][scol + j * 16 + tcol];
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+                sacc[j] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b[j], sacc[j], 0, 0, 0);
+            __syncthreads();
+        }
+        /* row max from registers */
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            int row = srow + trow * 4 + e, qg = q0 + row;
+            float mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                int kg = kt0 + scol + j * 16 + tcol;
+                if (!(kg > qg || kg >= qe)) mx = fmaxf(mx, sacc[j][e] * scale);
+            }
+#pragma unroll
+            for (int m = 1; m < 16; m <<= 1) mx = fmaxf(mx, __shfl_xor(mx, m, 64));
+            if (tcol == 0) rmax[chalf][row] = mx;
+        }
+        __syncthreads();
+        /* probs -> LDS (bf16) + row sums */
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            int row = srow + trow * 4 + e, qg = q0 + row;
+            float mn = fmaxf(m_[row], fmaxf(rmax[0][row], rmax[1][row]));
+            float sm = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                int col = scol + j * 16 + tcol, kg = kt0 + col;
+                float p = 0.0f;
+                if (!(kg > qg || kg >= qe)) p = __expf(sacc[j][e] * scale - mn);
+                Psh[row][col] = (__bf16)p;
+                sm += p;
+            }
+#pragma unroll
+            for (int m = 1; m < 16; m <<= 1) sm += __shfl_xor(sm, m, 64);
+            if (tcol == 0) rsum[chalf][row] = sm;
+        }
+        __syncthreads();
+        if (tx < 32) {
+            int row = tx;
+            float mo = m_[row], mn = fmaxf(mo, fmaxf(rmax[0][row], rmax[1][row]));
+            float corr = (mo == -INFINITY) ? 0.0f : __expf(mo - mn);
+            l_[row] = l_[row] * corr + rsum[0][row] + rsum[1][row];
+            m_[row] = mn;
+            corr_[row] = corr;
+        }
+        __syncthreads();
+        /* rescale running O, then O += P @ V over 4 column blocks of 64 */
+#pragma unroll
+        for (int nb = 0; nb < 4; nb++)
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++)
+                    oacc[nb][j][e] *= corr_[srow + trow * 4 + e];
+        /* nb and k0 MUST both unroll: oacc stays in registers only while its
+         * first index is a compile-time constant (a runtime index spilled
+         * 80 B/lane to scratch). */
+#pragma unroll
+        for (int nb = 0; nb < 4; nb++) {
+            int col0 = nb * 64;
+#pragma unroll
+            for (int k0 = 0; k0 < 64; k0 += 16) {
+                {
+                    int n = tx / 4, cc = (tx % 4) * 4;
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        int kg = kt0 + k0 + cc + e;
+                        Bs[cc + e][n] = (kg < qe)
+                            ? *reinterpret_cast<const __bf16 *>(&value_h[(size_t)kg * VHD + col0 + n])
+                            : (__bf16)0.0f;
+                    }
+                }
+                __syncthreads();
+                bf16x4a a, b[2];
+#pragma unroll
+                for (int e = 0; e < 4; e++) a[e] = Psh[srow + tcol][k0 + trow * 4 + e];
+#pragma unroll
+                for (int j = 0; j < 2; j++)
+#pragma unroll
+                    for (int e = 0; e < 4; e++) b[j][e] = Bs[trow * 4 + e][scol + j * 16 + tcol];
+#pragma unroll
+                for (int j = 0; j < 2; j++)
+                    oacc[nb][j] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b[j], oacc[nb][j], 0, 0, 0);
+                __syncthreads();
+            }
+        }
+    }
+    /* normalise and write ctx[query, head, d] */
+#pragma unroll
+    for (int nb = 0; nb < 4; nb++) {
+        int col0 = nb * 64;
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int col = col0 + scol + j * 16 + tcol;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int row = srow + trow * 4 + e, qg = q0 + row;
+                if (qg >= qe) continue;
+                float inv = (l_[row] > 0.0f) ? 1.0f / l_[row] : 0.0f;
+                ctx[((size_t)qg * NH + h) * VHD + col] = oacc[nb][j][e] * inv;
+            }
+        }
+    }
+}
+
+
+/* ======================================================================== *
+ * Retired (run65): the two device-side weight quantisers. Both took a bf16 copy
+ * that was already resident on the device; quant_from_host streams from the host
+ * mmap through one 6 MB staging buffer instead, which is what removed the 58 GB
+ * warm_up peak. quant_keep additionally LEFT the bf16 alive (2.6 GB) for a bf16
+ * fallback path that no longer exists.
+ * ======================================================================== */
+/* run20: quantize a bf16 weight [rows][cols] to int8 + per-row scale but KEEP the
+ * bf16 (lm_head and moe_gate deliberately stay bf16). */
+static void quant_keep(const bf16_t *src, int rows, int cols, int8_t **out_q, float **out_s)
+{
+    HIP_CHECK(hipMalloc((void **)out_q, (size_t)rows * cols * sizeof(int8_t)));
+    HIP_CHECK(hipMalloc((void **)out_s, (size_t)rows * sizeof(float)));
+    quantize_rows_i8_kernel<<<rows, 256>>>(src, *out_q, *out_s, rows, cols);
+}
+
+
+
+/* Quantize one bf16 weight [rows][cols] (device) into a fresh int8 buffer + fp32
+ * per-row scale buffer (device), then free the bf16 source. */
+static void quant_one_expert(bf16_t *src, int rows, int cols, int8_t **out_q, float **out_s)
+{
+    HIP_CHECK(hipMalloc((void **)out_q, (size_t)rows * cols * sizeof(int8_t)));
+    HIP_CHECK(hipMalloc((void **)out_s, (size_t)rows * sizeof(float)));
+    quantize_rows_i8_kernel<<<rows, 256>>>(src, *out_q, *out_s, rows, cols);
+    HIP_CHECK(hipFree(src));
+}
+
+
+
+
+
+
+/* Retired (run65): the standalone SwiGLU. Its last caller was the fp32 fallback for
+ * FFN rows too wide for the register-resident quantiser; silu_mul_quant_bf_big_kernel
+ * now covers that case in bf16 and fuses the quantise, so the fp32 round trip
+ * through hb is gone entirely.
+ * ======================================================================== */
+static void launch_silu_mul(float *hb, const float *hb2, int n)
+{
+    silu_mul_kernel<<<ceil_div(n, 256), 256, 0, g_str>>>(hb, hb2, n);
+}
+
+/* ======================================================================== *
+ * Retired (run66): the v_dot4 score version of the absorbed flash decode. Same
+ * kernel otherwise; attn_fd_mfma_kernel replaces its score loop with
+ * mfma_i32_16x16x16i8 and is 1846.1 vs 1835.5 tok/s (+0.6%) at B=1792 with a
+ * BIT-IDENTICAL output (the int32 score sum is exact either way, only its order
+ * changes). dot4 needed 144 instructions plus 288 LDS reads per thread per key
+ * tile; the MFMA form needs 9 MFMAs plus 18 LDS reads per wave, and gives most of
+ * that back in the LDS atomics that sum the four waves' partial tiles and in the
+ * block per CU that Sq costs.
+ *
+ * ALSO retired here (measured, do not retry): MFMA for BOTH matmuls, i.e. the clat
+ * accumulate on MFMA as well. That needs a transposed [d][key] tile; paying for it
+ * by moving the score's K operand to global reads cost -6.2% (1720.7 vs 1835.1),
+ * because a 4-byte-per-lane global read is exactly the starved access pattern the
+ * staged version exists to avoid. run39 had already measured the transpose at
+ * -1.5% with the score left on dot4.
+ * ======================================================================== */
+__global__ void attn_fd_hb_q8_kernel(float *clat, const float *qabs, const float *q,
+                                     const int8_t *kv_base, const float *kv_scale,
+                                     const int *pos, int NH, int QHD, int QKN, int QKR,
+                                     int KVL, int KVD, int slot_stride, float scale) {
+    constexpr int NGRP = FD_HPB * FD_KVL / 4;   /* (head, 4-r) groups        */
+    constexpr int CACC = NGRP / 256;            /* = 5 clat float4s/thread   */
+    const int s = blockIdx.x, g = blockIdx.y;
+    const int h0 = g * FD_HPB;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    (void)NH; (void)QKR; (void)KVL; (void)KVD;
+    const int kv_len = pos[s] + 1;
+    const int8_t *ckvb  = kv_base  + (size_t)s * slot_stride;
+    const float  *scl_s = kv_scale + (size_t)s * (slot_stride / FD_KVD);
+
+    __shared__ __attribute__((aligned(16))) int8_t Qsh[FD_HPB * FD_KPAD];
+    __shared__ __attribute__((aligned(16))) int8_t Ksh[FD_TK * FD_KPAD];
+    __shared__ float Kscl[FD_TK];
+    __shared__ float Ssh[FD_HPB * FD_TK];
+    __shared__ float Msh[FD_HPB], Lsh[FD_HPB], Csh[FD_HPB], Qsc[FD_HPB];
+    __shared__ unsigned Qmx[FD_HPB];
+
+    float oacc[CACC][4];
+#pragma unroll
+    for (int e = 0; e < CACC; e++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) oacc[e][j] = 0.0f;
+    if (tid < FD_HPB) { Msh[tid] = -INFINITY; Lsh[tid] = 0.0f; Qmx[tid] = 0u; }
+    __syncthreads();
+
+    /* ---- quantize this block's FD_HPB query rows to int8 (per-head scale) ---- */
+    for (int i = tid; i < FD_HPB * FD_KVD; i += nt) {
+        int h = i / FD_KVD, d = i - h * FD_KVD, hg = h0 + h;
+        float v = (d < FD_KVL) ? qabs[((size_t)s * FD_NH + hg) * FD_KVL + d]
+                               : q[((size_t)s * FD_NH + hg) * QHD + QKN + (d - FD_KVL)];
+        atomicMax(&Qmx[h], __float_as_uint(fabsf(v)));
+    }
+    __syncthreads();
+    if (tid < FD_HPB) Qsc[tid] = __uint_as_float(Qmx[tid]) / 127.0f;
+    __syncthreads();
+    for (int i = tid; i < FD_HPB * FD_KVD; i += nt) {
+        int h = i / FD_KVD, d = i - h * FD_KVD, hg = h0 + h;
+        float v = (d < FD_KVL) ? qabs[((size_t)s * FD_NH + hg) * FD_KVL + d]
+                               : q[((size_t)s * FD_NH + hg) * QHD + QKN + (d - FD_KVL)];
+        float sc = Qsc[h];
+        int qq = (sc > 0.0f) ? (int)rintf(v / sc) : 0;
+        qq = qq > 127 ? 127 : (qq < -127 ? -127 : qq);
+        Qsh[h * FD_KPAD + d] = (int8_t)qq;
+    }
+    __syncthreads();
+
+    const int KW = FD_KVD / 4;
+    const int KQ = FD_KVD / 16;
+    for (int k0 = 0; k0 < kv_len; k0 += FD_TK) {
+        const int tk = (kv_len - k0 < FD_TK) ? (kv_len - k0) : FD_TK;
+        for (int i = tid; i < tk * KQ; i += nt) {
+            int r = i / KQ, c = i - r * KQ;
+            int4 v = *reinterpret_cast<const int4 *>(ckvb + (size_t)(k0 + r) * FD_KVD + c * 16);
+            int8_t *d = Ksh + (size_t)r * FD_KPAD + c * 16;
+            *reinterpret_cast<int *>(d)      = v.x;
+            *reinterpret_cast<int *>(d + 4)  = v.y;
+            *reinterpret_cast<int *>(d + 8)  = v.z;
+            *reinterpret_cast<int *>(d + 12) = v.w;
+        }
+        for (int j = tid; j < tk; j += nt) Kscl[j] = scl_s[k0 + j];
+        __syncthreads();
+
+        /* scores: 4 int8 MACs per instruction, no unpack, no convert. */
+        for (int hk = tid; hk < FD_HPB * tk; hk += nt) {
+            int h = hk / tk, k = hk - h * tk;
+            const int *kw = reinterpret_cast<const int *>(Ksh + (size_t)k * FD_KPAD);
+            const int *qw = reinterpret_cast<const int *>(Qsh + (size_t)h * FD_KPAD);
+            int acc = 0;
+#pragma unroll 8
+            for (int c = 0; c < KW; c++) acc = __builtin_amdgcn_sdot4(qw[c], kw[c], acc, false);
+            Ssh[h * FD_TK + k] = (float)acc * Qsc[h] * Kscl[k] * scale;
+        }
+        __syncthreads();
+
+        if (tid < FD_HPB) {
+            int h = tid;
+            float tmax = -INFINITY;
+            for (int k = 0; k < tk; k++) tmax = fmaxf(tmax, Ssh[h * FD_TK + k]);
+            float mo = Msh[h], mn = fmaxf(mo, tmax);
+            float corr = (mo == -INFINITY) ? 0.0f : __expf(mo - mn);
+            float sum = 0.0f;
+            for (int k = 0; k < tk; k++) {
+                float p = __expf(Ssh[h * FD_TK + k] - mn);
+                sum += p;
+                Ssh[h * FD_TK + k] = p * Kscl[k];
+            }
+            Lsh[h] = Lsh[h] * corr + sum; Msh[h] = mn; Csh[h] = corr;
+        }
+        __syncthreads();
+
+        {
+            int g4 = tid;
+#pragma unroll
+            for (int e = 0; e < CACC; e++, g4 += nt) {
+                int h = g4 >> 7;
+                int r0 = (g4 & 127) << 2;
+                const float *Ph = Ssh + h * FD_TK;
+                const int8_t *kb0 = Ksh + r0;
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+                for (int k = 0; k < tk; k++) {
+                    int kb = *reinterpret_cast<const int *>(kb0 + (size_t)k * FD_KPAD);
+                    float p = Ph[k];
+                    a0 += p * (float)(int8_t)(kb & 0xff);
+                    a1 += p * (float)(int8_t)((kb >> 8) & 0xff);
+                    a2 += p * (float)(int8_t)((kb >> 16) & 0xff);
+                    a3 += p * (float)(int8_t)(kb >> 24);
+                }
+                float c = Csh[h];
+                oacc[e][0] = oacc[e][0] * c + a0;
+                oacc[e][1] = oacc[e][1] * c + a1;
+                oacc[e][2] = oacc[e][2] * c + a2;
+                oacc[e][3] = oacc[e][3] * c + a3;
+            }
+        }
+        __syncthreads();
+    }
+    {
+        int g4 = tid;
+#pragma unroll
+        for (int e = 0; e < CACC; e++, g4 += nt) {
+            if (CACC * 256 != NGRP && g4 >= NGRP) break;
+            int h = g4 >> 7, r0 = (g4 & 127) << 2, hg = h0 + h;
+            float inv = (Lsh[h] > 0.0f) ? 1.0f / Lsh[h] : 0.0f;
+            float *dst = clat + ((size_t)s * FD_NH + hg) * FD_KVL + r0;
+            dst[0] = oacc[e][0] * inv;
+            dst[1] = oacc[e][1] * inv;
+            dst[2] = oacc[e][2] * inv;
+            dst[3] = oacc[e][3] * inv;
+        }
+    }
+}
+
+/* ======================================================================== *
+ * MEASURED THREE TIMES, DO NOT RETRY: MFMA for the flash-decode clat accumulate.
+ *
+ * O[h][r] = sum_k P[h][k] * V[k][r] contracts along k, and an int8 MFMA needs 4
+ * consecutive CONTRACTION values packed per lane, so it needs a [r][key] copy of the
+ * key tile that the [key][d] staging (which the score wants) cannot provide.
+ *
+ *   run39: transpose + MFMA accumulate, score left on dot4      -1.5%
+ *   run66: MFMA for both, score's K operand moved to global to
+ *          pay for the transpose's LDS (4 B per lane per MFMA)  -6.2%  (1720.7)
+ *   run66: MFMA for both, score's K operand still staged, VT
+ *          built from Ksh in LDS, LDS 25 KB -> 2 blocks/CU      -3.7%  (1797.8)
+ *
+ * The last of these is the cleanest version of the idea and it still loses: the
+ * accumulate really does drop from ~720 VALU instructions per thread per key tile to
+ * 8 MFMAs plus a 64-instruction int32->fp32 fold, but the transpose costs 32 LDS
+ * dword writes per thread per tile, P has to be quantised to int8 (which also
+ * perturbs the output), and the 8 KB it needs takes the kernel from 3 blocks/CU to
+ * 2. What DOES pay is MFMA for the score alone (bit-identical, +0.6%), because that
+ * one needs no layout it does not already have.
+ * ======================================================================== */
+
+/* ======================================================================== *
+ * Superseded (run67, same session): the KV byte-copy path for duplicate prompts.
+ * It gave every follower slot its own copy of the leader's prefilled rows (8.4 GB
+ * of D2D at B=1792, ~14 ms) and got 3258.7 tok/s. Sharing the leader's KV SLOT
+ * instead does the same thing for free AND makes the cache cost one slot per
+ * distinct prompt instead of one per request (26 GB -> 7.5 GB at B=1792), which is
+ * what lets the batch grow. Kept here because the copy form is the one to fall back
+ * to if a future change makes duplicate slots diverge (the sharing relies on their
+ * decode being bit-identical, so their writes to the shared rows are the same
+ * bytes).
+ * ======================================================================== */
+__global__ void kv_dup_copy_kernel(int8_t *kv, const int *src, const int *dst,
+                                   const int *np, int slot_stride, size_t layer_stride,
+                                   int KVD) {
+    const int f = blockIdx.y, l = blockIdx.z;
+    const int n = np[f] * KVD;                       /* bytes for this follower */
+    const size_t base = (size_t)l * layer_stride;
+    const int8_t *s = kv + base + (size_t)src[f] * slot_stride;
+    int8_t       *d = kv + base + (size_t)dst[f] * slot_stride;
+    int i0 = (int)((blockIdx.x * blockDim.x + threadIdx.x) * 16);
+    if (i0 + 16 <= n)
+        *reinterpret_cast<int4 *>(d + i0) = *reinterpret_cast<const int4 *>(s + i0);
+    else
+        for (int i = i0; i < n; i++) d[i] = s[i];
+}
+
+__global__ void kv_dup_scale_kernel(float *sc, const int *src, const int *dst,
+                                    const int *np, int cap, size_t layer_stride) {
+    const int f = blockIdx.y, l = blockIdx.z;
+    const int n = np[f];
+    const size_t base = (size_t)l * layer_stride;
+    const float *s = sc + base + (size_t)src[f] * cap;
+    float       *d = sc + base + (size_t)dst[f] * cap;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = s[i];
+}
+

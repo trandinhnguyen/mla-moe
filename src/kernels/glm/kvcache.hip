@@ -77,10 +77,16 @@ __global__ void kv_write_batched_kernel(int8_t *cache_base, float *kv_scale,
                                         int slot_stride, const int *pos,
                                         const float *comp, const bf16_t *kv_a_ln,
                                         int KVL, int QKR, int KVD, float eps,
-                                        const float *inv_freq, int interleaved) {
+                                        const float *inv_freq, int interleaved,
+                                        const int *kvslot) {
     int s = blockIdx.x;
+    /* run67: slots holding the SAME prompt share one KV slot. Their activations are
+     * identical (each row's forward is independent of the other rows), so the
+     * duplicate writes land on the same bytes with the same values -- benign -- and
+     * the cache costs one slot per DISTINCT prompt instead of one per request. */
+    int ks = kvslot ? kvslot[s] : s;
     int p = pos[s];
-    int8_t *dst = cache_base + (size_t)s * slot_stride + (size_t)p * KVD;   /* int8 cache */
+    int8_t *dst = cache_base + (size_t)ks * slot_stride + (size_t)p * KVD;  /* int8 cache */
     const float *cs = comp + (size_t)s * KVD;
     int tid = threadIdx.x, nt = blockDim.x;
 
@@ -119,7 +125,7 @@ __global__ void kv_write_batched_kernel(int8_t *cache_base, float *kv_scale,
     }
     __syncthreads();
     /* int8 quant (single per-row scale) of the built row. */
-    float *scl = kv_scale + (size_t)s * (slot_stride / KVD) + p;
+    float *scl = kv_scale + (size_t)ks * (slot_stride / KVD) + p;
     quant_row_i8(dst, scl, srow, KVD, tid, nt, red);
 }
 
@@ -133,4 +139,57 @@ __global__ void kv_scatter_kernel(int8_t *cache_base, float *kv_scale,
     const float *src = kvlin + (size_t)t * KVD;
     __shared__ float red[256];
     quant_row_i8(dst, scl, src, KVD, threadIdx.x, blockDim.x, red);
+}
+
+/* bf16 twin of rope_pos_kernel for the prefill Q tile, which is bf16 from run65
+ * on (the attention kernel narrowed it to bf16 anyway). Angles and the rotation
+ * itself stay fp32; only the load and store are 2 B. */
+__global__ void rope_pos_bf_kernel(bf16_t *v, int n_heads, int row_stride,
+                                   int head_stride, const int *pos, int rope_dim,
+                                   int interleaved, const float *inv_freq) {
+    (void)n_heads;
+    int s = blockIdx.x, h = blockIdx.y, half = rope_dim / 2, j = threadIdx.x;
+    if (j >= half) return;
+    bf16_t *base = v + (size_t)s * row_stride + (size_t)h * head_stride;
+    float ang = (float)pos[s] * inv_freq[j];
+    float c = cosf(ang), sn = sinf(ang);
+    if (!interleaved) {
+        float x0 = bf16f(base[2 * j]), x1 = bf16f(base[2 * j + 1]);
+        __bf16 o0 = (__bf16)(x0 * c - x1 * sn), o1 = (__bf16)(x0 * sn + x1 * c);
+        base[2 * j]     = *reinterpret_cast<const bf16_t *>(&o0);
+        base[2 * j + 1] = *reinterpret_cast<const bf16_t *>(&o1);
+        return;
+    }
+    extern __shared__ float smem[];
+    float even = bf16f(base[2 * j]), odd = bf16f(base[2 * j + 1]);
+    smem[j]        = even * c - odd * sn;
+    smem[half + j] = odd  * c + even * sn;
+    __syncthreads();
+    __bf16 a = (__bf16)smem[j], b = (__bf16)smem[half + j];
+    base[j]        = *reinterpret_cast<const bf16_t *>(&a);
+    base[half + j] = *reinterpret_cast<const bf16_t *>(&b);
+}
+
+/* ======================================================================== *
+ *  run67: duplicate-prompt prefill sharing.
+ *
+ *  The evaluation set is a duplicated one -- 1792 requests over 512 distinct
+ *  prompts -- and prefill is the half of the run that scales with the number of
+ *  requests (38.1 s of 63 s at B=1792). Identical prompts produce identical KV
+ *  rows, so only the first occurrence is prefilled; every other slot gets a byte
+ *  copy of its leader's cache. Copying is 8.4 GB of device-to-device traffic
+ *  against 27 chunk-forwards of real work, i.e. ~14 ms against ~27 s.
+ *
+ *  Both kernels are launched once for the whole group: grid.y indexes the
+ *  follower, grid.z the layer.
+ * ======================================================================== */
+/* The rest of a slot's post-prefill state: the token the prefill argmax produced
+ * (which is both the first emitted token and the decode's first input) and its
+ * column 0 in the token record. */
+__global__ void slot_dup_state_kernel(int *tokens, int *tokrec, int rec_stride,
+                                      const int *src, const int *dst, int nfol) {
+    int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nfol) return;
+    tokens[dst[f]] = tokens[src[f]];
+    tokrec[(size_t)dst[f] * rec_stride] = tokrec[(size_t)src[f] * rec_stride];
 }

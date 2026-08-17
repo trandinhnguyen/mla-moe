@@ -20,6 +20,20 @@
  * ========================================================================== */
 #include "kernels.h"
 
+/* run65: the int8 GEMMs are templated on their OUTPUT type. Several of their
+ * consumers narrow to bf16 or to int8 immediately (the prefill Q tile is converted
+ * to bf16 inside the attention kernel; the FFN intermediate is quantised to int8 by
+ * silu_mul_quant), so writing fp32 there means writing -- and reading back -- twice
+ * the bytes for mantissa bits nobody looks at. bf16 uses the same round-to-nearest
+ * cast the consumers would have applied. */
+__device__ __forceinline__ void st_out(float &d, float v) { d = v; }
+__device__ __forceinline__ void st_out(bf16_t &d, float v) {
+    __bf16 b = (__bf16)v;
+    d = *reinterpret_cast<const bf16_t *>(&b);
+}
+
+
+
 using float4v = __attribute__((__vector_size__(16))) float;
 /* 4 packed bf16 = one lane's operand for mfma_f32_16x16x16bf16_1k. bf16_t is a
  * uint16_t holding a bfloat16 bit pattern, identical to the native __bf16, so a
@@ -170,23 +184,35 @@ __global__ void matmul_mfma_128_kernel(float *Y, const float *X, const bf16_t *W
 }
 
 /* ======================================================================== *
- *  bf16-ACTIVATION variant of matmul_mfma_128_kernel, for lm_head.
+ *  lm_head with the argmax FUSED INTO THE EPILOGUE (technique borrowed from the
+ *  DeepSeek engine's mfma_bf16_gemm_argmax_32x64).
  *
- *  lm_head is M=1280, N=154880, K=2048 -- 1210 column tiles, so the activation is
- *  re-read 1210 times: 12.7 GB per decode step against 6.3 GB for the weight, and
- *  together that is essentially all of its 19 ms. The kernel narrows X to bf16 in
- *  LDS anyway, so it never needed the fp32 bytes; taking X in already-bf16 halves
- *  the dominant term. One small pass (narrow_bf16_kernel) prepares it.
+ *  Only the argmax of each row of logits is ever used, yet the plain GEMM
+ *  materialises all of them: at B=1152 that is a 714 MB buffer, written in full
+ *  and read back in full every decode step (1.4 GB of traffic), and 714 MB is
+ *  more than the entire VRAM headroom left at the target config -- the engine
+ *  runs at 68.1 of 68.7 GB, which is exactly why the prefill chunk cannot grow
+ *  past 16384.
  *
- *  Numerically identical to the fp32-input kernel: same narrowing (truncation),
- *  same K order, same fp32 accumulate -- which matters because lm_head feeds the
- *  greedy argmax.
+ *  So each block reduces its own 128-column tile to one (max, index) pair per row
+ *  and writes that instead: pval/pidx[row][tile], ceil(vocab/128) = 1210 tiles, so
+ *  11 MB instead of 714 MB. A tiny second pass reduces over the tiles.
+ *
+ *  The in-block reduction follows the MFMA output layout: lane (trow, tcol) of
+ *  warp (srow, scol) holds acc[i][j][e] = Y[row0+srow+i*16+trow*4+e]
+ *  [col0+scol+j*16+tcol], i.e. 16 rows x 4 columns per lane. Reduce over j in
+ *  registers, then over tcol (the low 4 bits of the lane id, so __shfl_xor with
+ *  1/2/4/8 stays inside the 16-lane group), then merge the two column-halves of
+ *  each row through LDS. Ties take the lower index, matching the reference argmax.
  * ======================================================================== */
-__global__ void matmul_mfma_128_xbf_kernel(float *Y, const bf16_t *X, const bf16_t *W,
-                                           int M, int N, int K, int x_stride,
-                                           int y_stride) {
+__global__ void matmul_mfma_128_xbf_argmax_kernel(float *pval, int *pidx,
+                                                 const bf16_t *X, const bf16_t *W,
+                                                 int M, int N, int K, int x_stride,
+                                                 int tiles) {
     __shared__ __bf16 As[TBK][TBM2 + 4];
     __shared__ __bf16 Bs[TBK][TBN2 + 4];
+    __shared__ float shv[2][TBM2];
+    __shared__ int   shi[2][TBM2];
     int tx = threadIdx.x;
     int warp = tx / 64, tiw = tx % 64;
     int srow = (warp / 2) * 64, scol = (warp % 2) * 64;
@@ -215,37 +241,72 @@ __global__ void matmul_mfma_128_xbf_kernel(float *Y, const bf16_t *X, const bf16
         __syncthreads();
         bf16x4 a[4], b[4];
 #pragma unroll
-        for (int i2 = 0; i2 < 4; i2++)
+        for (int i = 0; i < 4; i++)
 #pragma unroll
-            for (int e = 0; e < 4; e++) a[i2][e] = As[trow * 4 + e][srow + i2 * 16 + tcol];
+            for (int e = 0; e < 4; e++) a[i][e] = As[trow * 4 + e][srow + i * 16 + tcol];
 #pragma unroll
         for (int j = 0; j < 4; j++)
 #pragma unroll
             for (int e = 0; e < 4; e++) b[j][e] = Bs[trow * 4 + e][scol + j * 16 + tcol];
 #pragma unroll
-        for (int i2 = 0; i2 < 4; i2++)
+        for (int i = 0; i < 4; i++)
 #pragma unroll
             for (int j = 0; j < 4; j++)
-                acc[i2][j] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a[i2], b[j], acc[i2][j], 0, 0, 0);
+                acc[i][j] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a[i], b[j], acc[i][j], 0, 0, 0);
         __syncthreads();
     }
+
+    /* ---- reduce this 128x128 tile to one (max,index) per row ---- */
 #pragma unroll
-    for (int i2 = 0; i2 < 4; i2++) {
-        int base_row = row0 + srow + i2 * 16 + trow * 4;
+    for (int i = 0; i < 4; i++) {
 #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            int col = col0 + scol + j * 16 + tcol;
-            if (col >= N) continue;
+        for (int e = 0; e < 4; e++) {
+            int lrow = srow + i * 16 + trow * 4 + e;      /* row within the tile */
+            float bv = -INFINITY; int bi = N;
 #pragma unroll
-            for (int e = 0; e < 4; e++) {
-                int row = base_row + e;
-                if (row < M) Y[(size_t)row * y_stride + col] = acc[i2][j][e];
+            for (int j = 0; j < 4; j++) {
+                int col = col0 + scol + j * 16 + tcol;
+                float v = acc[i][j][e];
+                if (col < N && (v > bv || (v == bv && col < bi))) { bv = v; bi = col; }
             }
+            /* over tcol: the 16 lanes sharing this row inside the warp */
+#pragma unroll
+            for (int m = 1; m < 16; m <<= 1) {
+                float ov = __shfl_xor(bv, m, 64);
+                int   oi = __shfl_xor(bi, m, 64);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            if (tcol == 0) { shv[scol / 64][lrow] = bv; shi[scol / 64][lrow] = bi; }
         }
+    }
+    __syncthreads();
+    /* ---- merge the two column halves and emit one pair per row ---- */
+    for (int lrow = tx; lrow < TBM2; lrow += 256) {
+        int row = row0 + lrow;
+        if (row >= M) continue;
+        float v0 = shv[0][lrow], v1 = shv[1][lrow];
+        int   i0 = shi[0][lrow], i1 = shi[1][lrow];
+        if (v1 > v0 || (v1 == v0 && i1 < i0)) { v0 = v1; i0 = i1; }
+        pval[(size_t)row * tiles + blockIdx.x] = v0;
+        pidx[(size_t)row * tiles + blockIdx.x] = i0;
     }
 }
 
-__global__ void matmul_mfma_i8i8_kernel(float *Y, const int8_t *Xq, const float *xsc,
+/* ======================================================================== *
+ *  bf16-ACTIVATION variant of matmul_mfma_128_kernel, for lm_head.
+ *
+ *  lm_head is M=1280, N=154880, K=2048 -- 1210 column tiles, so the activation is
+ *  re-read 1210 times: 12.7 GB per decode step against 6.3 GB for the weight, and
+ *  together that is essentially all of its 19 ms. The kernel narrows X to bf16 in
+ *  LDS anyway, so it never needed the fp32 bytes; taking X in already-bf16 halves
+ *  the dominant term. One small pass (narrow_bf16_kernel) prepares it.
+ *
+ *  Numerically identical to the fp32-input kernel: same narrowing (truncation),
+ *  same K order, same fp32 accumulate -- which matters because lm_head feeds the
+ *  greedy argmax.
+ * ======================================================================== */
+template <typename OT>
+__global__ void matmul_mfma_i8i8_kernel(OT *Y, const int8_t *Xq, const float *xsc,
                                         const int8_t *W, const float *wsc, int M, int N,
                                         int K, int x_stride, int y_stride) {
     __shared__ int8_t As[TBM][TBK];   /* [m][k], k contiguous */
@@ -292,7 +353,8 @@ __global__ void matmul_mfma_i8i8_kernel(float *Y, const int8_t *Xq, const float 
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 int row = base_row + e;
-                if (row < M) Y[(size_t)row * y_stride + col] = (float)acc[i][j][e] * wc * xsc[row];
+                if (row < M) st_out(Y[(size_t)row * y_stride + col],
+                                    (float)acc[i][j][e] * wc * xsc[row]);
             }
         }
     }
@@ -317,7 +379,8 @@ __global__ void matmul_mfma_i8i8_kernel(float *Y, const int8_t *Xq, const float 
  *  Tiles, K order and MFMA calls are untouched, so the output is BIT-IDENTICAL.
  *  Requires K % 32 == 0 and 16 B-aligned row strides; the callers check both.
  * ======================================================================== */
-__global__ void matmul_mfma_i8i8_128_w_kernel(float *Y, const int8_t *Xq, const float *xsc,
+template <typename OT>
+__global__ void matmul_mfma_i8i8_128_w_kernel(OT *Y, const int8_t *Xq, const float *xsc,
                                               const int8_t *W, const float *wsc, int M, int N,
                                               int K, int x_stride, int y_stride) {
     __shared__ __attribute__((aligned(16))) int8_t As[2][TBM2][32];
@@ -332,9 +395,19 @@ __global__ void matmul_mfma_i8i8_128_w_kernel(float *Y, const int8_t *Xq, const 
     const int aok = (arow < M), bok = (bcol < N);
     const int NG = K >> 5;                           /* 32-K groups                */
 
-    int4 ra = {0, 0, 0, 0}, rb = {0, 0, 0, 0}, na, nb;
+    /* run66: THREE-stage pipeline. The old form issued the load for group g+1 just
+     * before the MFMAs of group g, so it had one group of matrix work (~960 cycles)
+     * to cover an HBM miss that costs 1700-3400. Loading g+2 instead doubles that
+     * cover for 8 more VGPRs; LDS is what caps this kernel at 4 blocks/CU, not
+     * registers. */
+    int4 ra = {0, 0, 0, 0}, rb = {0, 0, 0, 0}, na = ra, nb = rb, pa = ra, pb = rb;
     if (aok) ra = *reinterpret_cast<const int4 *>(&Xq[(size_t)arow * x_stride + half * 16]);
     if (bok) rb = *reinterpret_cast<const int4 *>(&W[(size_t)bcol * K + half * 16]);
+    if (NG > 1) {
+        const size_t off1 = (size_t)32 + half * 16;
+        if (aok) na = *reinterpret_cast<const int4 *>(&Xq[(size_t)arow * x_stride + off1]);
+        if (bok) nb = *reinterpret_cast<const int4 *>(&W[(size_t)bcol * K + off1]);
+    }
     /* run49: stage the WHOLE 32-K group (both halves) at once, so the K loop
      * needs ONE barrier per 32 MFMAs instead of one per 16. LDS 8 -> 16 KB. */
     *reinterpret_cast<int4 *>(&As[0][m0][half * 16]) = ra;
@@ -344,11 +417,11 @@ __global__ void matmul_mfma_i8i8_128_w_kernel(float *Y, const int8_t *Xq, const 
     i32x4b acc[4][4] = {};
     int buf = 0;
     for (int g = 0; g < NG; g++) {
-        na = make_int4(0, 0, 0, 0); nb = make_int4(0, 0, 0, 0);
-        if (g + 1 < NG) {
-            const size_t off = (size_t)(g + 1) * 32 + half * 16;
-            if (aok) na = *reinterpret_cast<const int4 *>(&Xq[(size_t)arow * x_stride + off]);
-            if (bok) nb = *reinterpret_cast<const int4 *>(&W[(size_t)bcol * K + off]);
+        pa = make_int4(0, 0, 0, 0); pb = make_int4(0, 0, 0, 0);
+        if (g + 2 < NG) {
+            const size_t off = (size_t)(g + 2) * 32 + half * 16;
+            if (aok) pa = *reinterpret_cast<const int4 *>(&Xq[(size_t)arow * x_stride + off]);
+            if (bok) pb = *reinterpret_cast<const int4 *>(&W[(size_t)bcol * K + off]);
         }
 #pragma unroll
         for (int sub = 0; sub < 2; sub++) {
@@ -364,7 +437,7 @@ __global__ void matmul_mfma_i8i8_128_w_kernel(float *Y, const int8_t *Xq, const 
                     acc[i][j] = __builtin_amdgcn_mfma_i32_16x16x16i8(a[i], b[j], acc[i][j], 0, 0, 0);
         }
         if (g + 1 < NG) {
-            ra = na; rb = nb;
+            ra = na; rb = nb; na = pa; nb = pb;
             *reinterpret_cast<int4 *>(&As[buf ^ 1][m0][half * 16]) = ra;
             *reinterpret_cast<int4 *>(&Bs[buf ^ 1][m0][half * 16]) = rb;
         }
@@ -383,7 +456,8 @@ __global__ void matmul_mfma_i8i8_128_w_kernel(float *Y, const int8_t *Xq, const 
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 int row = base_row + e;
-                if (row < M) Y[(size_t)row * y_stride + col] = (float)acc[i][j][e] * wc * xsc[row];
+                if (row < M) st_out(Y[(size_t)row * y_stride + col],
+                                    (float)acc[i][j][e] * wc * xsc[row]);
             }
         }
     }
@@ -639,86 +713,132 @@ __global__ void matmul_headw_mfma_128_xbf_kernel(float *Y, const bf16_t *X, cons
     }
 }
 
-/* run45: prefetched twin of matmul_headw_mfma_kernel. Same tiles / K order /
- * MFMA calls (BIT-IDENTICAL); the K-loop keeps two LDS tile buffers and issues
- * the next tile's global loads before the MFMAs so the ~800-cycle miss is
- * covered -- the same lever that took the two hot int8 GEMMs from 982 to 1210
- * tok/s. This kernel is 4.0 s of prefill (per-head W_UK/W_UV materialisation).
- * of prefill (per-head W_UK/W_UV materialisation). */
-__global__ void matmul_headw_mfma_pf_kernel(float *Y, const float *X, const bf16_t *W,
-                                            int M, int N, int K, int x_stride,
-                                            int w_hstride, int y_hstride) {
+/* ======================================================================== *
+ *  As matmul_headw_mfma_128_xbf_kernel, but writes bf16 OUTPUT as well.
+ *
+ *  This is the prefill W_UK/W_UV materialisation, and it is bandwidth-bound on
+ *  re-reading its SHARED activation. With a 64-wide tile the two calls together
+ *  span (3 + 4) column tiles, and X is re-read once per (column tile, head), so
+ *  140 times: 2.94 GB per layer per chunk at T=10240, against 1.46 GB for the
+ *  weights. Two changes, both pure byte reductions:
+ *
+ *    - 128-wide tile: (2 + 2) x 20 = 80 re-reads instead of 140, and half the
+ *      weight re-reads too (80 row tiles instead of 160). N=192 wastes half of
+ *      its second column tile on MFMA work, which is free here -- the kernel is
+ *      nowhere near compute-bound.
+ *    - bf16 activation: the kernel narrows X to bf16 in LDS anyway, so the fp32
+ *      bytes were never needed. One narrow_bf16_kernel pass prepares it.
+ *
+ *  4.4 GB -> 1.6 GB per layer per chunk. X is shared across heads (that is the
+ *  point of this kernel: it folds 2*NH launches into 2), so only W and Y are
+ *  offset by head. grid = (ceil(N/128), ceil(M/128), NH).
+ * ======================================================================== */
+__global__ void matmul_headw_mfma_128_xbf_bfout_kernel(bf16_t *Y, const bf16_t *X, const bf16_t *W,
+                                                 int M, int N, int K, int x_stride,
+                                                 int w_hstride, int y_hstride) {
     int h = blockIdx.z;
     const bf16_t *Wh = W + (size_t)h * w_hstride;
-    float        *Yh = Y + (size_t)h * y_hstride;
+    bf16_t       *Yh = Y + (size_t)h * y_hstride;
 
-    __shared__ __bf16 As[2][TBK][TBM + 4];
-    __shared__ __bf16 Bs[2][TBK][TBN + 4];
+    __shared__ __bf16 As[TBK][TBM2 + 4];
+    __shared__ __bf16 Bs[TBK][TBN2 + 4];
     int tx = threadIdx.x;
     int warp = tx / 64, tiw = tx % 64;
-    int srow = (warp / 2) * 32, scol = (warp % 2) * 32;
+    int srow = (warp / 2) * 64, scol = (warp % 2) * 64;
     int trow = tiw / 16, tcol = tiw % 16;
-    int row0 = blockIdx.y * TBM, col0 = blockIdx.x * TBN;
-    const int am = tx / 4, acc4 = (tx % 4) * 4;          /* A: 64 rows x 4 k-quads */
-    const int bn = tx / (TBK / 8), bcc = (tx % (TBK / 8)) * 8;  /* B: 8 bf16 each   */
-    const int bact = (tx < TBN * TBK / 8);
+    int row0 = blockIdx.y * TBM2, col0 = blockIdx.x * TBN2;
 
-    float4 va; uint16_t wb[8];
-    auto loadA = [&](int k0) {
-        va = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (row0 + am < M) va = *reinterpret_cast<const float4 *>(&X[(size_t)(row0 + am) * x_stride + k0 + acc4]);
-    };
-    auto loadB = [&](int k0) {
+    /* run66: the global loads for k0 are issued BEFORE the MFMAs of k0-TBK, so the
+     * HBM latency overlaps the matrix work instead of being exposed once per K step
+     * (K = KVL = 512 means 32 steps, i.e. 32 serialised round trips per block). The
+     * LDS stays single-buffered -- double buffering would cost 8.4 KB and a block
+     * per CU, and this kernel is bandwidth-bound on re-reading its shared
+     * activation, not barrier-bound. */
+    const int am = tx / 4, acc4 = (tx % 4) * 4;
+    const int bn = tx / (TBK / 8), bcc = (tx % (TBK / 8)) * 8;
+    uint16_t xb[2][4] = {}, wb[8] = {};
 #pragma unroll
-        for (int j = 0; j < 8; j++) wb[j] = 0;
-        if (bact && col0 + bn < N)
-            __builtin_memcpy(wb, &Wh[(size_t)(col0 + bn) * K + k0 + bcc], 8 * sizeof(uint16_t));
-    };
-    auto store = [&](int buf) {
-        As[buf][acc4 + 0][am] = (__bf16)va.x; As[buf][acc4 + 1][am] = (__bf16)va.y;
-        As[buf][acc4 + 2][am] = (__bf16)va.z; As[buf][acc4 + 3][am] = (__bf16)va.w;
-        if (bact)
-#pragma unroll
-            for (int j = 0; j < 8; j++) Bs[buf][bcc + j][bn] = *reinterpret_cast<const __bf16 *>(&wb[j]);
-    };
+    for (int r = 0; r < TBM2 / 64; r++) {
+        int gr = row0 + r * 64 + am;
+        if (gr < M) __builtin_memcpy(xb[r], &X[(size_t)gr * x_stride + acc4], 4 * sizeof(uint16_t));
+    }
+    if (col0 + bn < N) __builtin_memcpy(wb, &Wh[(size_t)(col0 + bn) * K + bcc], 8 * sizeof(uint16_t));
 
-    loadA(0); loadB(0); store(0);
-    __syncthreads();
-
-    float4v acc[2][2] = {};
-    int buf = 0;
-    for (int k0 = 0; k0 < K; k0 += TBK, buf ^= 1) {
-        const int kn = k0 + TBK;
-        if (kn < K) { loadA(kn); loadB(kn); }
-        bf16x4 a[2], b[2];
+    float4v acc[4][4] = {};
+    for (int k0 = 0; k0 < K; k0 += TBK) {
 #pragma unroll
-        for (int i = 0; i < 2; i++)
+        for (int r = 0; r < TBM2 / 64; r++) {
+            int m = r * 64 + am;
 #pragma unroll
-            for (int e = 0; e < 4; e++) a[i][e] = As[buf][trow * 4 + e][srow + i * 16 + tcol];
+            for (int j = 0; j < 4; j++)
+                As[acc4 + j][m] = *reinterpret_cast<const __bf16 *>(&xb[r][j]);
+        }
 #pragma unroll
-        for (int j = 0; j < 2; j++)
+        for (int j = 0; j < 8; j++)
+            Bs[bcc + j][bn] = *reinterpret_cast<const __bf16 *>(&wb[j]);
+        __syncthreads();
+        if (k0 + TBK < K) {          /* prefetch the next K slice */
 #pragma unroll
-            for (int e = 0; e < 4; e++) b[j][e] = Bs[buf][trow * 4 + e][scol + j * 16 + tcol];
+            for (int r = 0; r < TBM2 / 64; r++) {
+                int gr = row0 + r * 64 + am;
+                uint16_t z[4] = {0, 0, 0, 0};
+                if (gr < M) __builtin_memcpy(z, &X[(size_t)gr * x_stride + k0 + TBK + acc4], 4 * sizeof(uint16_t));
 #pragma unroll
-        for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 4; j++) xb[r][j] = z[j];
+            }
+            uint16_t z2[8] = {0};
+            if (col0 + bn < N) __builtin_memcpy(z2, &Wh[(size_t)(col0 + bn) * K + k0 + TBK + bcc], 8 * sizeof(uint16_t));
 #pragma unroll
-            for (int j = 0; j < 2; j++)
-                acc[i][j] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a[i], b[j], acc[i][j], 0, 0, 0);
-        if (kn < K) store(buf ^ 1);
+            for (int j = 0; j < 8; j++) wb[j] = z2[j];
+        }
+        bf16x4 a[4], b[4];
+#pragma unroll
+        for (int i2 = 0; i2 < 4; i2++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) a[i2][e] = As[trow * 4 + e][srow + i2 * 16 + tcol];
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) b[j][e] = Bs[trow * 4 + e][scol + j * 16 + tcol];
+#pragma unroll
+        for (int i2 = 0; i2 < 4; i2++)
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+                acc[i2][j] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a[i2], b[j], acc[i2][j], 0, 0, 0);
         __syncthreads();
     }
 #pragma unroll
-    for (int i = 0; i < 2; i++) {
-        int base_row = row0 + srow + i * 16 + trow * 4;
+    for (int i2 = 0; i2 < 4; i2++) {
+        int base_row = row0 + srow + i2 * 16 + trow * 4;
 #pragma unroll
-        for (int j = 0; j < 2; j++) {
+        for (int j = 0; j < 4; j++) {
             int col = col0 + scol + j * 16 + tcol;
             if (col >= N) continue;
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 int row = base_row + e;
-                if (row < M) Yh[(size_t)row * N + col] = acc[i][j][e];
+                if (row < M) {
+                    /* bf16 out: the only consumer (attn_prefill_mfma) narrows these
+                     * with the same (__bf16) cast when staging them into LDS, so
+                     * writing bf16 here is bit-identical and halves both this write
+                     * and every one of the attention's re-reads. */
+                    __bf16 v = (__bf16)acc[i2][j][e];
+                    Yh[(size_t)row * N + col] = *reinterpret_cast<const bf16_t *>(&v);
+                }
             }
         }
     }
 }
+
+
+
+/* Explicit instantiations: fp32 out for everything whose consumer wants fp32,
+ * bf16 out for the prefill Q tile and the FFN intermediates. */
+template __global__ void matmul_mfma_i8i8_kernel<float>(float *, const int8_t *, const float *,
+        const int8_t *, const float *, int, int, int, int, int);
+template __global__ void matmul_mfma_i8i8_kernel<bf16_t>(bf16_t *, const int8_t *, const float *,
+        const int8_t *, const float *, int, int, int, int, int);
+template __global__ void matmul_mfma_i8i8_128_w_kernel<float>(float *, const int8_t *, const float *,
+        const int8_t *, const float *, int, int, int, int, int);
+template __global__ void matmul_mfma_i8i8_128_w_kernel<bf16_t>(bf16_t *, const int8_t *, const float *,
+        const int8_t *, const float *, int, int, int, int, int);

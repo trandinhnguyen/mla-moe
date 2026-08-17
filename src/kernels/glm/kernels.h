@@ -69,10 +69,19 @@ __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + __expf(-x)
 /* ---- elementwise.hip ---- */
 __global__ void embed_lookup_kernel(float *xs, const bf16_t *embed_tokens,
                                     const int *tokens, int H);
+__global__ void rmsnorm_f4_kernel(float *y, const float *x, const bf16_t *w,
+                                  int n, float eps, int x_row_stride,
+                                  int y_row_stride);
+__global__ void residual_add_f4_kernel(float *xs, const float *add, int n4);
 __global__ void rmsnorm_kernel(float *y, const float *x, const bf16_t *w,
                                int n, float eps, int x_row_stride,
                                int y_row_stride);
 __global__ void residual_add_kernel(float *xs, const float *add, int n);
+/* Fused residual-add + RMSNorm: four buffer passes instead of five (borrowed from
+ * the DeepSeek engine). Writes the updated residual AND its normalised copy. */
+__global__ void residual_rmsnorm_kernel(float *x, float *y, const float *branch,
+                                        const bf16_t *w, int n, float eps,
+                                        int x_stride, int y_stride);
 __global__ void silu_mul_kernel(float *hb, const float *hb2, int n);
 __global__ void copy_strided_kernel(float *dst, const float *src, int n,
                                     int dst_row_stride, int src_row_stride);
@@ -105,6 +114,12 @@ __global__ void transpose_wuk_kernel(bf16_t *out, const bf16_t *in, int QKN,
 /* One lane's int32 MFMA accumulator (mfma_i32_16x16x16i8 returns 4 int32). */
 using i32x4b = __attribute__((__vector_size__(16))) int;
 __global__ void narrow_bf16_kernel(bf16_t *dst, const float *src, int n);
+/* Reduces the fused-argmax lm_head's per-tile (max,index) pairs to one token per
+ * row, and takes over the decode bookkeeping argmax_batched_kernel used to do. */
+__global__ void argmax_reduce_kernel(const float *pval, const int *pidx, int tiles,
+                                     int *out, const int *slotmap, int *tokrec,
+                                     int rec_stride, int step, const int *stepp,
+                                     int *pos, int cap);
 
 /* ---- gemm.hip ---- */
 __global__ void matmul_mfma_kernel(float *Y, const float *X, const bf16_t *W,
@@ -116,14 +131,19 @@ __global__ void matmul_mfma_kernel(float *Y, const float *X, const bf16_t *W,
 __global__ void matmul_mfma_128_kernel(float *Y, const float *X, const bf16_t *W,
                                        int M, int N, int K, int x_stride,
                                        int y_stride);
+/* lm_head with the argmax fused into the epilogue: emits one (max,index) pair per
+ * (row, 128-column tile) instead of the full logits, which removes a 714 MB buffer
+ * and 1.4 GB of traffic per decode step. Borrowed from the DeepSeek engine. */
+__global__ void matmul_mfma_128_xbf_argmax_kernel(float *pval, int *pidx,
+                                                 const bf16_t *X, const bf16_t *W,
+                                                 int M, int N, int K, int x_stride,
+                                                 int tiles);
 /* bf16-activation variant of matmul_mfma_128, for lm_head: its 1210 column tiles
  * re-read the activation 1210 times, and the kernel narrows X to bf16 anyway. */
-__global__ void matmul_mfma_128_xbf_kernel(float *Y, const bf16_t *X, const bf16_t *W,
-                                           int M, int N, int K, int x_stride,
-                                           int y_stride);
 /* run20 W8A8 dense GEMM: int8 activation (per-row xsc) x int8 weight (per-row wsc)
  * via mfma_i32_16x16x16i8; halves the L2 weight bytes of the bf16 matmul_mfma. */
-__global__ void matmul_mfma_i8i8_kernel(float *Y, const int8_t *Xq, const float *xsc,
+template <typename OT>
+__global__ void matmul_mfma_i8i8_kernel(OT *Y, const int8_t *Xq, const float *xsc,
                                         const int8_t *W, const float *wsc, int M, int N,
                                         int K, int x_stride, int y_stride);
 /* Per-head [M=B,N=d_out]=X@W^T GEMM on the matrix cores (head = grid.z). Weight
@@ -134,6 +154,15 @@ __global__ void matmul_bh_mfma_kernel(float *Y, const float *X, const bf16_t *W,
                                       int x_bstride, int w_stride, int y_hstride,
                                       int y_bstride);
 /* ---- kvcache.hip ---- */
+__global__ void rope_pos_bf_kernel(bf16_t *v, int n_heads, int row_stride,
+                                   int head_stride, const int *pos, int rope_dim,
+                                   int interleaved, const float *inv_freq);
+__global__ void quant_act_rows_i8_bf_kernel(const bf16_t *X, int8_t *Q, float *scale,
+                                            int rows, int K, int x_stride);
+__global__ void quant_act_rows_i8_bf_big_kernel(const bf16_t *X, int8_t *Q, float *scale,
+                                                int rows, int K, int x_stride);
+__global__ void silu_mul_quant_bf_big_kernel(const bf16_t *hb, const bf16_t *hb2,
+                                            int8_t *Q, float *scale, int rows, int K);
 __global__ void rope_pos_kernel(float *v, int n_heads, int row_stride,
                                 int head_stride, const int *pos, int rope_dim,
                                 int interleaved, const float *inv_freq);
@@ -154,9 +183,12 @@ __global__ void kv_write_batched_kernel(int8_t *cache_base, float *kv_scale,
                                         int slot_stride, const int *pos,
                                         const float *comp, const bf16_t *kv_a_ln,
                                         int KVL, int QKR, int KVD, float eps,
-                                        const float *inv_freq, int interleaved);
+                                        const float *inv_freq, int interleaved,
+                                        const int *kvslot);
 /* Chunked-prefill: scatter contiguous kvlin[n_tok][KVD] rows into per-slot cache
  * at (slot[t], pos[t]) as int8 + per-row scale; gather last-token rows for lm_head. */
+__global__ void slot_dup_state_kernel(int *tokens, int *tokrec, int rec_stride,
+                                      const int *src, const int *dst, int nfol);
 __global__ void kv_scatter_kernel(int8_t *cache_base, float *kv_scale,
                                   int slot_stride, const int *slot, const int *pos,
                                   const float *kvlin, int KVD, int n_tok);
@@ -165,6 +197,8 @@ __global__ void gather_rows_kernel(float *dst, const float *src, const int *idx,
 /* Fused SwiGLU + per-row int8 quantisation: silu(hb)*hb2 -> int8, without the
  * fp32 round trip through HBM the two separate kernels needed. Same shape limits
  * as quant_act_rows_i8_fast_kernel (K % 4 == 0, K <= 2048). */
+__global__ void silu_mul_quant_bf_kernel(const bf16_t *hb, const bf16_t *hb2,
+                                      int8_t *Q, float *scale, int rows, int K);
 __global__ void silu_mul_quant_kernel(const float *hb, const float *hb2,
                                       int8_t *Q, float *scale, int rows, int K);
 
@@ -193,6 +227,11 @@ __global__ void quant_act_rows_i8_fast_kernel(const float *X, int8_t *Q, float *
 __global__ void matmul_headw_mfma_128_xbf_kernel(float *Y, const bf16_t *X, const bf16_t *W,
                                                  int M, int N, int K, int x_stride,
                                                  int w_hstride, int y_hstride);
+/* Same, writing bf16: knope/value are only ever read by attn_prefill_mfma,
+ * which narrows them to bf16 anyway -- bit-identical, half the bytes. */
+__global__ void matmul_headw_mfma_128_xbf_bfout_kernel(bf16_t *Y, const bf16_t *X,
+                                                 const bf16_t *W, int M, int N, int K,
+                                                 int x_stride, int w_hstride, int y_hstride);
 /* run45: prefetched (double-buffered) twin of matmul_headw_mfma_kernel.
  * Bit-identical. */
 /* 128x128-tile twin of matmul_bh_mfma_kernel: halves the total L2 traffic of the
@@ -201,16 +240,14 @@ __global__ void matmul_bh_mfma_128_kernel(float *Y, const float *X, const bf16_t
                                           int M, int N, int K, int x_hstride,
                                           int x_bstride, int w_stride, int y_hstride,
                                           int y_bstride);
-__global__ void matmul_headw_mfma_pf_kernel(float *Y, const float *X, const bf16_t *W,
-                                            int M, int N, int K, int x_stride,
-                                            int w_hstride, int y_hstride);
 /* run44: wide-load (int4/lane) + deep-prefetch variants of the two hot
  * 128x128 int8 GEMMs. Bit-identical; need K % 32 == 0 and 16 B-aligned row
  * strides (checked by the callers). */
-__global__ void matmul_mfma_i8i8_128_w_kernel(float *Y, const int8_t *Xq, const float *xsc,
+template <typename OT>
+__global__ void matmul_mfma_i8i8_128_w_kernel(OT *Y, const int8_t *Xq, const float *xsc,
                                               const int8_t *W, const float *wsc, int M, int N,
                                               int K, int x_stride, int y_stride);
-__global__ void moe_grouped_mfma_i8i8_128_w_kernel(float *out_sorted, const int8_t *Xq,
+__global__ void moe_grouped_mfma_i8i8_128_w_kernel(bf16_t *out_sorted, const int8_t *Xq,
                                                    const float *xsc, const int8_t *const *Wtbl,
                                                    const float *const *Stbl, const int *eoff,
                                                    const int *sorted_slot, int N, int K,
@@ -223,9 +260,9 @@ __global__ void quantize_rows_i8_kernel(const bf16_t *W, int8_t *Q, float *S,
 /* MoE epilogue: gather each token's K routed expert outputs (fixed k order, so
  * deterministic) plus the shared expert, in one pass. Replaces zero + atomic
  * scatter + shared add. */
-__global__ void moe_gather_add_kernel(float *out, const float *down_sorted,
+__global__ void moe_gather_add_kernel(float *out, const bf16_t *down_sorted,
                                       const float *sorted_wt, const int *inv,
-                                      const float *shared, int K, int H);
+                                      const bf16_t *shared, int K, int H);
 
 /* ---- attention.hip ---- */
 
@@ -233,9 +270,9 @@ __global__ void moe_gather_add_kernel(float *out, const float *down_sorted,
  * prompt per tile. qt_q0/qt_qs/qt_qe = per-tile first-query / prompt-start /
  * prompt-end (global). grid = (num_qtiles, NH), block = 256. Replaces the scalar
  * attn_unabsorbed_flash_varlen_kernel. */
-__global__ void attn_prefill_mfma_kernel(float *ctx, const float *qall,
-                                         const float *knope, const float *kv_l,
-                                         const float *value, const int *qt_q0,
+__global__ void attn_prefill_mfma_kernel(bf16_t *ctx, const bf16_t *qall,
+                                         const bf16_t *knope, const float *kv_l,
+                                         const bf16_t *value, const int *qt_q0,
                                          const int *qt_qs, const int *qt_qe,
                                          int n_tok, int NH, int QHD, int QKN, int QKR,
                                          int KVD, int KVL, int VHD, float scale);

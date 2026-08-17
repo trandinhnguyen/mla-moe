@@ -68,6 +68,12 @@
  * against the model's own max_seq_len at warm_up() time. */
 #define CACHE_CAP_LIMIT 16384
 
+/* Row block for the dense-layer FFN. Only layer 0 is dense and it is row-parallel,
+ * so processing it in blocks keeps the SwiGLU scratch (hb/hb2) sized by this
+ * instead of by the whole prefill chunk -- worth ~1 GB of VRAM at T=16384, on an
+ * engine that otherwise runs with 0.6 GB to spare. */
+#define DENSE_ROWS 4096
+
 /* Per-model differences (all Config-driven, handled inline where they matter):
  *                       DeepSeek-V2-Lite       GLM-4.7-Flash
  *   query projection    single q_proj          q_a/q_b LoRA (q_lora_rank > 0)
@@ -79,6 +85,16 @@
  * entered only for GLM Transformers, but the forward path stays config-driven. */
 
 static ModelWeights d_w;         /* device pointers, same layout as host ModelWeights */
+/* run65: per-layer slabs backing the int8 expert tables (one allocation each
+ * instead of 3*NR per layer -- see quant_from_host_into). */
+static int8_t **d_eslab_q = NULL;
+static float  **d_eslab_s = NULL;
+
+/* run67: slot -> KV slot. Requests with identical prompts share one KV slot, so the
+ * cache is sized by DISTINCT prompts (g_kvslots) instead of by batch. NULL until the
+ * first group builds it. */
+static int   *b_kvslot = NULL;
+
 static int8_t *d_kv_cache = NULL; /* int8 [n_layers, g_batch, g_cap, KVD]; run16: int8 quarters
                                    * the ~24GB@B=384 fp32 cache (run15 was bf16). */
 static float  *d_kv_scale = NULL; /* fp32 [n_layers, g_batch, g_cap]: per-(slot,pos) row scale. */
@@ -93,7 +109,7 @@ static int    g_cache_cap = 0;
  * advances all g_batch slots together (weights read once per batch). g_batch /
  * g_cap are set in warm_up; g_batch is overridable via MLA_BATCH. All decode
  * scratch below is allocated once (grow-free hot path) sized for g_batch. */
-static int    g_batch = 1152;  /* concurrent requests per group (<= this); overridable
+static int    g_batch = 32768;  /* concurrent requests per group (<= this); overridable
                                 * via MLA_BATCH. run15 (bf16 KV) freed VRAM to raise the sweet spot
                                 * 384->512; run16 made the KV cache int8 (~16GB@B=1024, quarter of the
                                 * old fp32); run17 showed a larger CLEAN group still helps. run18
@@ -104,6 +120,7 @@ static int    g_batch = 1152;  /* concurrent requests per group (<= this); overr
                                 * tok/s (acc PASS). NB near the VRAM ceiling on a 68GB-free GCD -- B>=1536
                                 * or g_pfchunk>=12288 OOM at B=1280; lower MLA_BATCH / MLA_PFCHUNK if a
                                 * busier shared GCD OOMs. int8 KV cache (~20GB@1280) is what makes it fit. */
+static int    g_kvslots = 0;   /* KV slots allocated (<= g_batch); set in warm_up */
 static int    g_cap   = 576;   /* per-slot cache positions (max prompt 512 + 64 steps) */
 static int    g_pfchunk = 16384; /* chunked-prefill token budget: pack whole prompts up
                                  * to this many tokens into one batched forward so weights
@@ -118,10 +135,15 @@ static int    g_pfchunk = 16384; /* chunked-prefill token budget: pack whole pro
                                  * ~10240 (12288 OOMs), giving 831->836.65 tok/s. Default 10240
                                  * pairs with the default B=1280; drop it if a busier GCD OOMs. */
 
-static float *b_x, *b_xb, *b_qa, *b_q, *b_comp, *b_qabs, *b_score, *b_clat;
-static float *b_ctx, *b_ao, *b_mo, *b_hb, *b_hb2, *b_shared;
-static float *b_moelog, *b_topk_wt, *b_sorted_wt, *b_hbk, *b_hb2k, *b_downk;
-static float *b_logits;
+static float *b_x, *b_xb, *b_qa, *b_q, *b_comp, *b_qabs, *b_clat;
+static float *b_ctx, *b_ao, *b_mo;
+static bf16_t *b_shared;       /* run65: only moe_gather_add reads it */
+static bf16_t *b_hb, *b_hb2;   /* run65: bf16 FFN intermediates (see launch_swiglu_w8a8) */
+static float *b_moelog, *b_topk_wt, *b_sorted_wt;
+/* run65: the three grouped-GEMM outputs are bf16 -- gate/up feed silu+quantise and
+ * down feeds a weighted fp32 sum, so nothing read the extra mantissa. Halves both
+ * their traffic and their 1.34 GB of VRAM. */
+static bf16_t *b_hbk, *b_hb2k, *b_downk;
 /* run19 W8A8 MoE: int8 activations + per-row scale for gate/up (xn) and down (hbk). */
 static int8_t *b_xn_i8, *b_hbk_i8;
 static float  *b_xn_scale, *b_hbk_scale;
@@ -195,6 +217,10 @@ enum {
     B_XBF16,
     /* latent KV narrowed to bf16 for the per-head W_UK/W_UV GEMMs */
     B_KVBF,
+    /* fused-argmax lm_head: per-(row, 128-col tile) max and index */
+    B_LMPV, B_LMPI,
+    /* duplicate-prompt prefill sharing: [3][nfol] = leader slot, follower slot, len */
+    B_DUPIDX,
     B_NBUF
 };
 typedef struct { void *ptr; size_t bytes; } DevBuf;
@@ -212,6 +238,7 @@ static hipStream_t g_str = 0;
  * step issues an identical sequence of launches, so ONE captured graph replays
  * for all of them -- ~1900 launches per step become one hipGraphLaunch. */
 static int *b_step = NULL;
+static int g_graph_bg = -1;   /* group size the captured graph was built for */
 static hipGraphExec_t g_dec_graph = NULL;
 
 static void *sbuf(int i, size_t bytes)

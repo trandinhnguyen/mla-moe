@@ -122,7 +122,7 @@ __global__ void moe_place_kernel(const int *topk_idx, const float *topk_wt,
     inv[t] = p;
 }
 
-__global__ void moe_grouped_mfma_i8i8_128_w_kernel(float *out_sorted, const int8_t *Xq,
+__global__ void moe_grouped_mfma_i8i8_128_w_kernel(bf16_t *out_sorted, const int8_t *Xq,
                                                    const float *xsc, const int8_t *const *Wtbl,
                                                    const float *const *Stbl, const int *eoff,
                                                    const int *sorted_slot, int N, int K,
@@ -152,9 +152,19 @@ __global__ void moe_grouped_mfma_i8i8_128_w_kernel(float *out_sorted, const int8
     const int aok = (arow != (size_t)-1);
     const int NG = K >> 5;
 
-    int4 ra = {0, 0, 0, 0}, rb = {0, 0, 0, 0}, na, nb;
+    /* run66: THREE-stage pipeline. The old form issued the load for group g+1 just
+     * before the MFMAs of group g, so it had one group of matrix work (~960 cycles)
+     * to cover an HBM miss that costs 1700-3400. Loading g+2 instead doubles that
+     * cover for 8 more VGPRs; LDS is what caps this kernel at 4 blocks/CU, not
+     * registers. */
+    int4 ra = {0, 0, 0, 0}, rb = {0, 0, 0, 0}, na = ra, nb = rb, pa = ra, pb = rb;
     if (aok) ra = *reinterpret_cast<const int4 *>(&Xq[arow * x_stride + half * 16]);
     if (bok) rb = *reinterpret_cast<const int4 *>(&W[(size_t)bcol * K + half * 16]);
+    if (NG > 1) {
+        const size_t off1 = (size_t)32 + half * 16;
+        if (aok) na = *reinterpret_cast<const int4 *>(&Xq[arow * x_stride + off1]);
+        if (bok) nb = *reinterpret_cast<const int4 *>(&W[(size_t)bcol * K + off1]);
+    }
     /* run49: stage the WHOLE 32-K group (both halves) at once, so the K loop
      * needs ONE barrier per 32 MFMAs instead of one per 16. LDS 8 -> 16 KB. */
     *reinterpret_cast<int4 *>(&As[0][m0][half * 16]) = ra;
@@ -164,27 +174,39 @@ __global__ void moe_grouped_mfma_i8i8_128_w_kernel(float *out_sorted, const int8
     i32x4b acc[4][4] = {};
     int buf = 0;
     for (int g = 0; g < NG; g++) {
-        na = make_int4(0, 0, 0, 0); nb = make_int4(0, 0, 0, 0);
-        if (g + 1 < NG) {
-            const size_t off = (size_t)(g + 1) * 32 + half * 16;
-            if (aok) na = *reinterpret_cast<const int4 *>(&Xq[arow * x_stride + off]);
-            if (bok) nb = *reinterpret_cast<const int4 *>(&W[(size_t)bcol * K + off]);
+        pa = make_int4(0, 0, 0, 0); pb = make_int4(0, 0, 0, 0);
+        if (g + 2 < NG) {
+            const size_t off = (size_t)(g + 2) * 32 + half * 16;
+            if (aok) pa = *reinterpret_cast<const int4 *>(&Xq[arow * x_stride + off]);
+            if (bok) pb = *reinterpret_cast<const int4 *>(&W[(size_t)bcol * K + off]);
         }
 #pragma unroll
         for (int sub = 0; sub < 2; sub++) {
             int a[4], b[4];
 #pragma unroll
-            for (int i = 0; i < 4; i++) a[i] = *reinterpret_cast<const int *>(&As[buf][srow + i * 16 + tcol][sub * 16 + trow * 4]);
-#pragma unroll
             for (int j = 0; j < 4; j++) b[j] = *reinterpret_cast<const int *>(&Bs[buf][scol + j * 16 + tcol][sub * 16 + trow * 4]);
+            /* Skip the 16-row sub-tiles that lie entirely past this expert's row
+             * count. At decode an expert gets about T*K/NR = 72 rows, so 44% of a
+             * 128-row tile is padding: three of the eight 16-row sub-tiles are
+             * completely dead. The loops stay unrolled (the predicate is per
+             * unrolled body, so acc[][] keeps its registers). */
 #pragma unroll
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < 4; i++) a[i] = *reinterpret_cast<const int *>(&As[buf][srow + i * 16 + tcol][sub * 16 + trow * 4]);
+            /* Keep the four A loads issued together (batching them is what hides the
+             * LDS latency -- moving each next to its own MFMAs cost 3.8%) and only
+             * predicate the MFMA group: at decode an expert gets about T*K/NR = 72
+             * rows, so three of the eight 16-row sub-tiles of a 128-row tile are
+             * entirely padding. Loops stay unrolled so acc[][] keeps its registers. */
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                if (row0 + srow + i * 16 >= cnt) continue;
 #pragma unroll
                 for (int j = 0; j < 4; j++)
                     acc[i][j] = __builtin_amdgcn_mfma_i32_16x16x16i8(a[i], b[j], acc[i][j], 0, 0, 0);
+            }
         }
         if (g + 1 < NG) {
-            ra = na; rb = nb;
+            ra = na; rb = nb; na = pa; nb = pb;
             *reinterpret_cast<int4 *>(&As[buf ^ 1][m0][half * 16]) = ra;
             *reinterpret_cast<int4 *>(&Bs[buf ^ 1][m0][half * 16]) = rb;
         }
@@ -205,7 +227,13 @@ __global__ void moe_grouped_mfma_i8i8_128_w_kernel(float *out_sorted, const int8
                 int p = prow_base + e2;
                 if (p < cnt) {
                     int sr = gather ? sorted_slot[base + p] : (base + p);
-                    out_sorted[(size_t)(base + p) * N + col] = (float)acc[i][j][e2] * wc * xsc[sr];
+                    /* run65: bf16 out. Every consumer of these three buffers either
+                     * quantises to int8 next (gate/up -> silu_mul_quant) or scales
+                     * and sums into an fp32 residual (down -> moe_gather_add), so
+                     * fp32 here was 8 extra bits nobody read: 402 MB written + 804
+                     * MB read back per layer per chunk at T=16384, halved. */
+                    __bf16 v = (__bf16)((float)acc[i][j][e2] * wc * xsc[sr]);
+                    out_sorted[(size_t)(base + p) * N + col] = *reinterpret_cast<const bf16_t *>(&v);
                 }
             }
         }
@@ -225,16 +253,18 @@ __global__ void moe_grouped_mfma_i8i8_128_w_kernel(float *out_sorted, const int8
  * so the same input produced slightly different logits between runs, which greedy
  * decoding then amplified into different tokens. Gathering in k order makes the
  * result deterministic. */
-__global__ void moe_gather_add_kernel(float *out, const float *down_sorted,
+__global__ void moe_gather_add_kernel(float *out, const bf16_t *down_sorted,
                                       const float *sorted_wt, const int *inv,
-                                      const float *shared, int K, int H) {
-    int row = blockIdx.y;
-    int d = blockIdx.x * blockDim.x + threadIdx.x;
+                                      const bf16_t *shared, int K, int H) {
+    /* run67: row on grid.x, hidden on grid.y -- grid.y is capped at 65535 and row is
+     * the batch here, so the old order put a ceiling on the batch size. */
+    int row = blockIdx.x;
+    int d = blockIdx.y * blockDim.x + threadIdx.x;
     if (d >= H) return;
     float acc = 0.0f;
     for (int k = 0; k < K; k++) {
         int p = inv[row * K + k];
-        acc += sorted_wt[p] * down_sorted[(size_t)p * H + d];
+        acc += sorted_wt[p] * bf16f(down_sorted[(size_t)p * H + d]);
     }
-    out[(size_t)row * H + d] = acc + shared[(size_t)row * H + d];
+    out[(size_t)row * H + d] = acc + bf16f(shared[(size_t)row * H + d]);
 }
