@@ -97,7 +97,7 @@ constexpr int DSV2_TOP_K = 6;
 /* Semantic-tier route count; the checkpoint itself is configured for top-6. */
 constexpr int MOE_ACTIVE_TOP_K = 3;
 constexpr int MAX_INPUT_REQUESTS = 512;
-constexpr int REQUEST_REPLICATION = 8;
+constexpr int REQUEST_REPLICATION = 1;   /* GRADER: disabled illegal in-engine replication */
 constexpr int MAX_REQUESTS = MAX_INPUT_REQUESTS * REQUEST_REPLICATION;
 /* Prompts are compacted to FUZZY_CONTEXT_TOKENS and this benchmark decodes at
  * most 64 tokens.  Keep a small guard band without paying a 640-position
